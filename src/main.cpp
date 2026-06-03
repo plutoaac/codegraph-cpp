@@ -1,3 +1,41 @@
+/**
+ * main.cpp — CLI 入口和索引编排
+ *
+ * 本文件是 codegraph 的 CLI 入口，负责：
+ *   1. 解析命令行参数，分发到对应的命令处理函数
+ *   2. 编排索引流程：遍历目录 → 提析 → 存储 → 解析引用
+ *   3. 实现增量索引：只处理变更的文件
+ *   4. 上下文感知的边消歧：同名函数跨文件时优先选择同文件/目录/命名空间的候选
+ *
+ * 支持的 CLI 命令：
+ *   init              — 初始化 .codegraph/ 目录和数据库
+ *   index [<path>]    — 索引源文件（增量）
+ *   resolve           — 解析未解析的跨文件引用
+ *   search <query>    — 符号搜索
+ *   context <symbol>  — 符号上下文
+ *   dead-code         — 死代码检测
+ *   cycles            — 循环依赖检测（Tarjan SCC）
+ *   path <from> <to>  — 调用链路径查找
+ *   metrics           — 调用图指标统计
+ *   impact-chain      — 影响链分析
+ *   export --dot      — DOT 格式导出
+ *   change-impact     — git diff 影响分析
+ *   serve --mcp       — 启动 MCP 服务器
+ *   watch             — 文件监听 + 自动增量索引
+ *
+ * 索引流程：
+ *   1. 遍历目录，收集变更文件（增量：比较 mtime/size）
+ *   2. 用 tree-sitter 提取每个文件的节点和未解析引用
+ *   3. 批量插入节点到数据库
+ *   4. 解析未解析引用：按名字查找候选节点，用上下文评分选择最佳匹配
+ *   5. 批量插入边到数据库
+ *
+ * 上下文感知边消歧：
+ *   当多个同名函数存在时（如多个文件都有 WaitServerReady），
+ *   优先选择与源节点在同一文件/目录/命名空间的候选。
+ *   评分规则：同文件 +10, 同目录 +5, 同命名空间 +3
+ */
+
 #include "codegraph/core/types.h"
 #include "codegraph/db/database.h"
 #include "codegraph/extraction/extractor.h"
@@ -25,6 +63,9 @@
 using namespace codegraph;
 namespace fs = std::filesystem;
 
+/**
+ * 打印使用帮助。
+ */
 static void print_usage() {
     std::cout << R"(Usage: codegraph <command> [options]
 
@@ -50,6 +91,12 @@ Commands:
 )" << std::endl;
 }
 
+/**
+ * 向上查找 .codegraph/index 数据库路径。
+ *
+ * 从当前目录开始，逐级向上查找 .codegraph/index 文件。
+ * 这样在子目录中也能找到项目根目录的索引。
+ */
 static std::string get_db_path() {
     fs::path cwd = fs::current_path();
     while (true) {
@@ -63,6 +110,9 @@ static std::string get_db_path() {
     return "";
 }
 
+/**
+ * 打开数据库，找不到则报错退出。
+ */
 static Database open_db() {
     std::string path = get_db_path();
     if (path.empty()) {
@@ -73,6 +123,9 @@ static Database open_db() {
     return db;
 }
 
+/**
+ * 判断文件是否应该跳过（隐藏目录、构建目录、依赖目录等）。
+ */
 static bool should_skip(const std::string& file_path) {
     return file_path.find("/.") != std::string::npos ||
            file_path.find("/node_modules/") != std::string::npos ||
@@ -82,14 +135,24 @@ static bool should_skip(const std::string& file_path) {
            file_path.find("\\.git\\") != std::string::npos;
 }
 
+/**
+ * 待索引文件的中间结构。
+ *
+ * 提取阶段的结果先存在这里，后续批量插入数据库。
+ * id_map 用于将 tree-sitter 分配的临时负 ID 映射为数据库的真实 ID。
+ */
 struct PendingIndexedFile {
     std::string file_path;
     std::string language;
     ExtractionResult result;
-    std::unordered_map<int64_t, int64_t> id_map;
+    std::unordered_map<int64_t, int64_t> id_map;  // 临时ID → 真实ID
     int inserted_edges = 0;
 };
 
+/**
+ * 创建文件记录（用于 files 表）。
+ * 读取文件的修改时间和大小，用于增量索引判断。
+ */
 static FileRecord make_file_record(const std::string& file_path, const std::string& lang) {
     FileRecord fr;
     fr.path = file_path;
@@ -106,9 +169,15 @@ static FileRecord make_file_record(const std::string& file_path, const std::stri
     return fr;
 }
 
+/**
+ * 判断文件是否已变更（增量索引用）。
+ *
+ * 比较数据库中记录的 mtime/size 与文件系统的当前值。
+ * 如果不一致，说明文件被修改过，需要重新索引。
+ */
 static bool is_changed(Database& db, const fs::directory_entry& entry, const std::string& file_path) {
     auto existing = db.get_file(file_path);
-    if (!existing.has_value()) return true;
+    if (!existing.has_value()) return true;  // 新文件
 
     try {
         auto ftime = fs::last_write_time(entry);
@@ -117,10 +186,18 @@ static bool is_changed(Database& db, const fs::directory_entry& entry, const std
         return existing->mtime != mtime ||
                existing->size != static_cast<int64_t>(fs::file_size(entry));
     } catch (...) {
-        return true;
+        return true;  // 读取失败，保守处理
     }
 }
 
+/**
+ * 提取单个文件的节点和调用关系。
+ *
+ * 流程：
+ *   1. 根据语言创建对应的提取器（C++ 或 Python）
+ *   2. 读取文件内容
+ *   3. 调用提取器的 extract() 方法
+ */
 static bool extract_file(const std::string& file_path, const std::string& lang, PendingIndexedFile& out) {
     auto extractor = create_extractor(lang);
     if (!extractor) return false;
@@ -136,18 +213,30 @@ static bool extract_file(const std::string& file_path, const std::string& lang, 
     return true;
 }
 
-// 上下文感知的候选目标评分。
-// 当多个同名函数存在时（如多个文件都有 WaitServerReady），
-// 优先选择与源节点在同一文件/目录/命名空间的候选。
-// 评分规则：同文件 +10, 同目录 +5, 同命名空间 +3
+/**
+ * 上下文感知的候选目标评分。
+ *
+ * 当多个同名函数存在时（如多个文件都有 WaitServerReady），
+ * 优先选择与源节点在同一文件/目录/命名空间的候选。
+ *
+ * 评分规则：
+ *   同文件 +10  — 最强信号（同一个 .cpp 里的函数大概率互相调用）
+ *   同目录 +5   — 中等信号（同模块的函数可能有关联）
+ *   同命名空间 +3 — 弱信号（同命名空间可能有关联）
+ *
+ * 为什么需要这个：
+ *   tree-sitter 没有类型信息，只能用名字匹配。
+ *   如果项目中有多个同名函数（如 test_helper() 在多个测试文件中），
+ *   不加消歧会错误地连接到远处的同名函数。
+ */
 static int score_target(const Node& source, const Node& candidate) {
     int score = 0;
 
-    // 同文件 = 最强信号（同一个 .cpp 里的函数大概率互相调用）
+    // 同文件 = 最强信号
     if (source.file_path == candidate.file_path) {
         score += 10;
     } else {
-        // Same directory = moderate signal
+        // 同目录 = 中等信号
         auto src_dir = source.file_path.rfind('/');
         auto cand_dir = candidate.file_path.rfind('/');
         if (src_dir != std::string::npos && cand_dir != std::string::npos) {
@@ -158,7 +247,7 @@ static int score_target(const Node& source, const Node& candidate) {
         }
     }
 
-    // Matching namespace/qualifier prefix
+    // 同命名空间 = 弱信号
     if (!source.qualified_name.empty() && !candidate.qualified_name.empty()) {
         auto src_colon = source.qualified_name.rfind("::");
         auto cand_colon = candidate.qualified_name.rfind("::");
@@ -174,6 +263,12 @@ static int score_target(const Node& source, const Node& candidate) {
     return score;
 }
 
+/**
+ * 清理已删除文件的索引数据。
+ *
+ * 遍历数据库中的所有文件记录，检查文件是否还存在。
+ * 如果文件已被删除，清理其节点、边和未解析引用。
+ */
 static bool prune_deleted_files(Database& db) {
     bool pruned = false;
     for (const auto& file : db.get_all_files()) {
@@ -197,14 +292,29 @@ static bool prune_deleted_files(Database& db) {
     return pruned;
 }
 
+/**
+ * 将提取结果批量写入数据库。
+ *
+ * 流程：
+ *   1. 清理旧数据（按文件路径删除旧的 refs/edges/nodes）
+ *   2. 创建文件节点（每个文件一个 File 类型节点）
+ *   3. 批量插入所有节点，收集返回的真实 ID
+ *   4. 建立临时 ID → 真实 ID 的映射
+ *   5. 解析未解析引用：按名字查找候选，用上下文评分选择最佳匹配
+ *   6. 批量插入边（contains 边 + calls 边）
+ *   7. 批量插入剩余的未解析引用
+ *   8. 更新文件记录
+ *
+ * 事务保证：
+ *   整个过程在一个事务中，任何失败都会回滚。
+ */
 static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& files) {
     if (files.empty()) return 0;
 
     db.begin_transaction();
     try {
 
-    // Cleanup must run before deleting nodes because unresolved refs are keyed
-    // through existing node ids.
+    // 清理旧数据（顺序重要：先删 refs，因为引用了 node id）
     for (const auto& file : files) {
         db.delete_unresolved_refs_by_file(file.file_path);
     }
@@ -215,11 +325,11 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
         db.delete_nodes_by_file(file.file_path);
     }
 
-    // Batch insert all nodes (add file nodes first)
+    // 批量插入所有节点
     std::vector<Node> all_nodes;
-    std::unordered_map<std::string, int64_t> file_node_indices;  // file_path -> index in all_nodes
+    std::unordered_map<std::string, int64_t> file_node_indices;
     for (auto& file : files) {
-        // Create a file node
+        // 创建文件节点
         Node file_node;
         file_node.kind = NodeKind::File;
         file_node.name = file.file_path;
@@ -228,7 +338,7 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
         file_node_indices[file.file_path] = all_nodes.size();
         all_nodes.push_back(file_node);
 
-        // Add all other nodes
+        // 添加该文件中的所有其他节点
         for (auto& node : file.result.nodes) {
             all_nodes.push_back(node);
         }
@@ -236,17 +346,16 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
     std::vector<int64_t> all_ids;
     db.insert_nodes_batch(all_nodes, all_ids);
 
-    // Build id_map for each file (account for file node at offset 0)
+    // 建立临时 ID → 真实 ID 的映射
     int node_count = 0;
     size_t offset = 0;
     std::vector<Edge> contains_edges;
     for (auto& file : files) {
-        // The file node is at offset
         int64_t file_node_id = (offset < all_ids.size()) ? all_ids[offset] : -1;
         if (file_node_id < 0) { db.rollback(); return 0; }
         file_node_indices[file.file_path] = file_node_id;
 
-        // Map temp IDs to real IDs (skip file node at offset 0)
+        // 映射临时 ID 到真实 ID（跳过 offset 0 的文件节点）
         for (size_t i = 0; i < file.result.nodes.size(); ++i) {
             int64_t temp_id = -static_cast<int64_t>(i + 1);
             int64_t real_id = (offset + 1 + i < all_ids.size()) ? all_ids[offset + 1 + i] : -1;
@@ -254,7 +363,7 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
             file.id_map[temp_id] = real_id;
             node_count++;
 
-            // Create "contains" edge from file to this node
+            // 创建 "contains" 边：文件 → 节点
             Edge ce;
             ce.source_id = file_node_id;
             ce.target_id = real_id;
@@ -266,13 +375,11 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
         offset += file.result.nodes.size() + 1;  // +1 for file node
     }
 
-    // Resolve refs: batch collect edges and unresolved refs.
-    // Use context-aware matching: prefer targets in the same file/directory/namespace
-    // as the source node, to avoid connecting to wrong same-named functions.
+    // 解析未解析引用：按名字查找候选，用上下文评分选择最佳匹配
     std::vector<Edge> new_edges;
     std::vector<UnresolvedRef> new_unresolved;
-    std::unordered_set<std::string> seen_edges;  // Deduplicate edges
-    std::unordered_map<std::string, std::vector<Node>> name_cache;  // Cache candidates
+    std::unordered_set<std::string> seen_edges;  // 边去重
+    std::unordered_map<std::string, std::vector<Node>> name_cache;  // 候选缓存
 
     for (auto& file : files) {
         for (auto& ref : file.result.unresolved) {
@@ -281,8 +388,7 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
             if (it != file.id_map.end()) source_real = it->second;
             if (source_real <= 0) continue;
 
-            // Get source node info from extracted results for scoring
-            // temp_id = -(index+1), so index = -temp_id - 1
+            // 获取源节点信息（用于上下文评分）
             Node source_info;
             int src_idx = -ref.source_node_id - 1;
             if (src_idx >= 0 && src_idx < static_cast<int>(file.result.nodes.size())) {
@@ -290,7 +396,7 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
             }
             source_info.file_path = file.file_path;
 
-            // Get candidates (cached)
+            // 获取候选节点（带缓存）
             auto cache_it = name_cache.find(ref.ref_name);
             if (cache_it == name_cache.end()) {
                 auto candidates = db.find_nodes_by_name(ref.ref_name, 10);
@@ -299,7 +405,7 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
 
             const auto& targets = cache_it->second;
             if (!targets.empty()) {
-                // Pick best candidate by context score
+                // 用上下文评分选择最佳候选
                 int64_t best_id = targets[0].id;
                 int best_score = -1;
                 for (const auto& cand : targets) {
@@ -310,7 +416,7 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
                     }
                 }
 
-                // Deduplicate: same source + target + kind = same edge
+                // 边去重：同一对 source+target+kind 只保留一条
                 std::string edge_key = std::to_string(source_real) + ":" +
                                        std::to_string(best_id) + ":" +
                                        std::to_string(static_cast<int>(EdgeKind::Calls));
@@ -325,6 +431,7 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
                 }
                 file.inserted_edges++;
             } else {
+                // 未找到目标，保留为未解析引用
                 UnresolvedRef uref;
                 uref.source_node_id = source_real;
                 uref.ref_name = ref.ref_name;
@@ -336,11 +443,12 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
         }
     }
 
-    // Insert both contains edges and call edges
+    // 批量插入边（contains 边 + calls 边）
     contains_edges.insert(contains_edges.end(), new_edges.begin(), new_edges.end());
     db.insert_edges_batch(contains_edges);
     db.insert_unresolved_batch(new_unresolved);
 
+    // 更新文件记录
     for (const auto& file : files) {
         if (db.insert_file(make_file_record(file.file_path, file.language)) < 0) {
             db.rollback();
@@ -356,9 +464,12 @@ static int index_extracted_files(Database& db, std::vector<PendingIndexedFile>& 
     }
 }
 
-// Second pass: resolve previously-unresolved refs now that all files are indexed.
-// Uses context-aware matching: prefers targets in the same file/directory/namespace
-// as the source node, to avoid connecting to wrong same-named functions.
+/**
+ * 第二遍：解析之前未解析的引用。
+ *
+ * 现在所有文件都已索引，可以尝试将之前无法解析的引用解析为正式的边。
+ * 使用与 index_extracted_files 相同的上下文感知评分策略。
+ */
 static void resolve_unresolved_refs(Database& db) {
     auto refs = db.get_unresolved_refs();
     if (refs.empty()) {
@@ -368,7 +479,7 @@ static void resolve_unresolved_refs(Database& db) {
 
     std::cout << "Resolving " << refs.size() << " unresolved refs..." << std::endl;
 
-    // Batch-fetch all source nodes referenced by unresolved refs
+    // 批量获取所有源节点
     std::unordered_set<int64_t> source_ids;
     for (const auto& ref : refs) {
         source_ids.insert(ref.source_node_id);
@@ -380,7 +491,7 @@ static void resolve_unresolved_refs(Database& db) {
         source_map[n.id] = n;
     }
 
-    // Cache: ref_name -> list of candidate targets (fetch with higher limit for scoring)
+    // 候选缓存
     std::unordered_map<std::string, std::vector<Node>> name_cache;
 
     std::vector<Edge> new_edges;
@@ -392,7 +503,7 @@ static void resolve_unresolved_refs(Database& db) {
         if (src_it == source_map.end()) continue;
         const Node& source = src_it->second;
 
-        // Get candidates (cached)
+        // 获取候选（带缓存）
         auto cache_it = name_cache.find(ref.ref_name);
         if (cache_it == name_cache.end()) {
             auto candidates = db.find_nodes_by_name(ref.ref_name, 10);
@@ -402,7 +513,7 @@ static void resolve_unresolved_refs(Database& db) {
         const auto& candidates = cache_it->second;
         if (candidates.empty()) continue;
 
-        // Pick best candidate by context score
+        // 用上下文评分选择最佳候选
         int64_t best_id = candidates[0].id;
         int best_score = -1;
         for (const auto& cand : candidates) {
@@ -443,7 +554,21 @@ static void resolve_unresolved_refs(Database& db) {
     }
 }
 
-// Index all source files in a directory
+/**
+ * 索引目录中的所有源文件。
+ *
+ * 增量索引流程：
+ *   1. 清理已删除文件的索引
+ *   2. 遍历目录，收集变更文件（比较 mtime/size）
+ *   3. 对变更文件，还要重新索引引用它的其他文件
+ *      （因为被引用者的行号可能变了）
+ *   4. 提取并批量写入数据库
+ *
+ * 为什么要重新索引引用者：
+ *   如果文件 A 的函数签名变了，文件 B 中对它的调用边
+ *   可能需要更新（行号变了）。通过 get_edges_to() 找到 B，
+ *   然后把 B 也加入重新索引列表。
+ */
 static void index_directory(Database& db, const std::string& path, bool incremental = true) {
     std::vector<std::pair<std::string, std::string>> changed_files;
     std::unordered_set<std::string> scheduled_paths;
@@ -455,6 +580,7 @@ static void index_directory(Database& db, const std::string& path, bool incremen
         }
     };
 
+    // 遍历目录，收集变更文件
     for (auto& entry : fs::recursive_directory_iterator(path)) {
         if (!entry.is_regular_file()) continue;
         std::string file_path = entry.path().string();
@@ -476,6 +602,7 @@ static void index_directory(Database& db, const std::string& path, bool incremen
         return;
     }
 
+    // 增量模式：也要重新索引引用了变更文件的其他文件
     if (incremental) {
         std::vector<std::string> initially_changed;
         initially_changed.reserve(changed_files.size());
@@ -484,6 +611,7 @@ static void index_directory(Database& db, const std::string& path, bool incremen
         }
 
         for (const auto& file_path : initially_changed) {
+            // 找到所有指向该文件节点的 Calls 边
             for (const auto& node : db.find_nodes_by_file(file_path)) {
                 for (const auto& edge : db.get_edges_to(node.id, EdgeKind::Calls)) {
                     auto source = db.get_node(edge.source_id);
@@ -502,6 +630,7 @@ static void index_directory(Database& db, const std::string& path, bool incremen
         }
     }
 
+    // 提取并批量写入
     std::vector<PendingIndexedFile> extracted;
     extracted.reserve(changed_files.size());
     for (const auto& [file_path, lang] : changed_files) {
@@ -516,6 +645,10 @@ static void index_directory(Database& db, const std::string& path, bool incremen
               << node_count << " nodes, " << db.count_edges() << " edges" << std::endl;
 }
 
+/**
+ * 运行 Python 脚本（用于语义搜索的 embed/query）。
+ * 使用 fork+execvp，不经过 shell。
+ */
 static int run_python(const std::vector<std::string>& args) {
     std::vector<char*> argv;
     argv.reserve(args.size() + 2);
@@ -549,6 +682,14 @@ static int run_python(const std::vector<std::string>& args) {
     return 1;
 }
 
+/**
+ * CLI 主入口：解析命令行参数，分发到对应的命令处理。
+ *
+ * 命令分发逻辑：
+ *   - 每个命令用 if-else if 链匹配
+ *   - 参数解析在各个分支中独立完成
+ *   - 简单的命令直接输出文本，复杂的命令输出 JSON
+ */
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         print_usage();
@@ -558,6 +699,7 @@ int main(int argc, char* argv[]) {
     std::string cmd = argv[1];
 
     if (cmd == "init") {
+        // ── init: 初始化 .codegraph/ 目录和数据库 ──
         std::string index_path;
         bool do_index = false;
 
@@ -588,6 +730,7 @@ int main(int argc, char* argv[]) {
         }
 
     } else if (cmd == "index") {
+        // ── index: 增量索引源文件 ──
         Database db = open_db();
         std::string path = argc > 2 ? argv[2] : ".";
         std::cout << "Indexing " << path << "..." << std::endl;
@@ -595,10 +738,12 @@ int main(int argc, char* argv[]) {
         resolve_unresolved_refs(db);
 
     } else if (cmd == "resolve") {
+        // ── resolve: 解析未解析的跨文件引用 ──
         Database db = open_db();
         resolve_unresolved_refs(db);
 
     } else if (cmd == "search") {
+        // ── search: 符号搜索 ──
         if (argc < 3) {
             std::cerr << "Usage: codegraph search <query>" << std::endl;
             return 1;
@@ -618,7 +763,7 @@ int main(int argc, char* argv[]) {
             seen_files[n.file_path] = true;
         }
         std::cout << output;
-        // Token stats
+        // Token 统计：帮助用户了解使用 codegraph 节省了多少 token
         int resp_tokens = static_cast<int>(output.size()) / 4;
         size_t raw_bytes = 0;
         for (auto& [f, _] : seen_files) {
@@ -635,6 +780,7 @@ int main(int argc, char* argv[]) {
         }
 
     } else if (cmd == "context") {
+        // ── context: 符号上下文 ──
         if (argc < 3) {
             std::cerr << "Usage: codegraph context <symbol>" << std::endl;
             return 1;
@@ -645,16 +791,14 @@ int main(int argc, char* argv[]) {
         auto result = context.build_context(argv[2]);
         std::string output = result.dump(2);
         std::cout << output << std::endl;
-        // Token stats
         int resp_tokens = static_cast<int>(output.size()) / 4;
         std::cerr << "[codegraph] " << resp_tokens << " tokens returned" << std::endl;
 
     } else if (cmd == "embed") {
-        // Find embed.py relative to the codegraph binary
+        // ── embed: 生成语义搜索的嵌入向量 ──
         fs::path bin_path = fs::canonical(argv[0]);
         fs::path script_path = bin_path.parent_path() / ".." / "scripts" / "embed.py";
         if (!fs::exists(script_path)) {
-            // Try source directory
             script_path = fs::path(CMAKE_SOURCE_DIR) / "scripts" / "embed.py";
         }
         std::string db_path = get_db_path();
@@ -665,6 +809,7 @@ int main(int argc, char* argv[]) {
         return run_python({script_path.string(), "index", db_path});
 
     } else if (cmd == "search-semantic") {
+        // ── search-semantic: 语义搜索 ──
         if (argc < 3) {
             std::cerr << "Usage: codegraph search-semantic <query>" << std::endl;
             return 1;
@@ -683,12 +828,14 @@ int main(int argc, char* argv[]) {
         return run_python({script_path.string(), "query", db_path, query});
 
     } else if (cmd == "status") {
+        // ── status: 索引统计 ──
         Database db = open_db();
         std::cout << "Nodes: " << db.count_nodes() << std::endl;
         std::cout << "Edges: " << db.count_edges() << std::endl;
         std::cout << "Files: " << db.count_files() << std::endl;
 
     } else if (cmd == "dead-code") {
+        // ── dead-code: 死代码检测 ──
         Database db = open_db();
         auto dead_nodes = db.find_dead_code();
         if (dead_nodes.empty()) {
@@ -711,6 +858,7 @@ int main(int argc, char* argv[]) {
         }
 
     } else if (cmd == "cycles") {
+        // ── cycles: 循环依赖检测（Tarjan SCC） ──
         Database db = open_db();
         GraphTraverser traverser(db);
         auto cycles = traverser.find_circular_dependencies();
@@ -739,6 +887,7 @@ int main(int argc, char* argv[]) {
         }
 
     } else if (cmd == "path") {
+        // ── path: 调用链路径查找 ──
         if (argc < 4) {
             std::cerr << "Usage: codegraph path <from_symbol> <to_symbol>" << std::endl;
             return 1;
@@ -780,6 +929,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[codegraph] Path depth: " << path.size() << std::endl;
 
     } else if (cmd == "metrics") {
+        // ── metrics: 调用图指标统计 ──
         Database db = open_db();
         GraphTraverser traverser(db);
         auto metrics = traverser.compute_metrics(10);
@@ -812,6 +962,7 @@ int main(int argc, char* argv[]) {
                   << metrics.circular_deps << " cycles" << std::endl;
 
     } else if (cmd == "impact-chain") {
+        // ── impact-chain: 影响链分析 ──
         if (argc < 3) {
             std::cerr << "Usage: codegraph impact-chain <symbol>" << std::endl;
             return 1;
@@ -851,7 +1002,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[codegraph] Impact: " << impact.size() << " symbols affected" << std::endl;
 
     } else if (cmd == "export") {
-        // Parse arguments: export --dot [--symbol <name>] [--depth <n>]
+        // ── export: DOT 格式导出 ──
         bool dot_format = false;
         std::string symbol;
         int depth = 2;
@@ -870,12 +1021,11 @@ int main(int argc, char* argv[]) {
         Database db = open_db();
         GraphTraverser traverser(db);
 
-        // Collect nodes and edges to export
         std::vector<Node> nodes;
         std::vector<Edge> edges;
 
         if (!symbol.empty()) {
-            // Export subgraph around a specific symbol
+            // 导出特定符号的子图
             auto found = db.find_nodes_by_name(symbol, 1);
             if (found.empty()) {
                 std::cerr << "Symbol not found: " << symbol << std::endl;
@@ -884,14 +1034,12 @@ int main(int argc, char* argv[]) {
             Node& start = found[0];
             nodes.push_back(start);
 
-            // Get callers and callees
             auto callers = traverser.get_callers(start.id, depth);
             auto callees = traverser.get_callees(start.id, depth);
 
             for (auto& n : callers.nodes) nodes.push_back(n);
             for (auto& n : callees.nodes) nodes.push_back(n);
 
-            // Deduplicate edges (callers and callees may share edges)
             std::unordered_set<int64_t> seen_edge_ids;
             auto add_edge = [&](const Edge& e) {
                 if (seen_edge_ids.insert(e.id).second) {
@@ -901,7 +1049,7 @@ int main(int argc, char* argv[]) {
             for (auto& e : callers.edges) add_edge(e);
             for (auto& e : callees.edges) add_edge(e);
 
-            // Get file nodes and contains edges
+            // 获取文件节点和 contains 边
             std::unordered_set<std::string> file_paths;
             for (auto& n : nodes) {
                 if (!n.file_path.empty()) file_paths.insert(n.file_path);
@@ -911,7 +1059,6 @@ int main(int argc, char* argv[]) {
                 for (auto& fn : file_nodes) {
                     if (fn.kind == NodeKind::File) {
                         nodes.push_back(fn);
-                        // Get contains edges from file to other nodes
                         auto contains = db.get_all_edges_from(fn.id);
                         for (auto& e : contains) {
                             if (e.kind == EdgeKind::Contains) {
@@ -923,7 +1070,7 @@ int main(int argc, char* argv[]) {
                 }
             }
         } else {
-            // Export full graph (limited to functions/classes)
+            // 导出完整图（限函数/类）
             auto all_files = db.get_all_files();
             for (auto& f : all_files) {
                 auto file_nodes = db.find_nodes_by_file(f.path);
@@ -934,7 +1081,6 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
-            // Get all edges between these nodes
             std::unordered_set<int64_t> node_ids;
             for (auto& n : nodes) node_ids.insert(n.id);
             for (auto& n : nodes) {
@@ -947,9 +1093,8 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Generate DOT output
+        // 生成 DOT 输出
         auto escape_dot = [](std::string s) -> std::string {
-            // Escape special characters for DOT labels
             std::string result;
             for (char c : s) {
                 switch (c) {
@@ -972,12 +1117,10 @@ int main(int argc, char* argv[]) {
         std::cout << "  node [shape=box, style=filled, fontname=\"Courier\"];" << std::endl;
         std::cout << std::endl;
 
-        // Output nodes
         std::unordered_map<int64_t, std::string> node_labels;
         for (auto& n : nodes) {
             std::string label = escape_dot(n.name);
             if (!n.signature.empty()) {
-                // Truncate long signatures
                 std::string sig = n.signature;
                 if (sig.size() > 50) sig = sig.substr(0, 47) + "...";
                 label += "\\n" + escape_dot(sig);
@@ -988,11 +1131,11 @@ int main(int argc, char* argv[]) {
             std::string color;
             switch (n.kind) {
                 case NodeKind::Function: case NodeKind::Method:
-                    color = "#E3F2FD"; break;  // Light blue
+                    color = "#E3F2FD"; break;  // 浅蓝
                 case NodeKind::Class: case NodeKind::Struct:
-                    color = "#E8F5E9"; break;  // Light green
+                    color = "#E8F5E9"; break;  // 浅绿
                 default:
-                    color = "#FFF3E0"; break;  // Light orange
+                    color = "#FFF3E0"; break;  // 浅橙
             }
 
             std::cout << "  " << node_id << " [label=\"" << label
@@ -1001,7 +1144,6 @@ int main(int argc, char* argv[]) {
 
         std::cout << std::endl;
 
-        // Output edges
         for (auto& e : edges) {
             auto src = node_labels.find(e.source_id);
             auto dst = node_labels.find(e.target_id);
@@ -1016,6 +1158,7 @@ int main(int argc, char* argv[]) {
                   << edges.size() << " edges" << std::endl;
 
     } else if (cmd == "change-impact") {
+        // ── change-impact: git diff 影响分析 ──
         std::string ref = (argc > 2) ? argv[2] : "";
         std::string diff_output = run_git_diff(ref);
         if (diff_output.empty()) {
@@ -1043,7 +1186,6 @@ int main(int argc, char* argv[]) {
             auto nodes_in_file = db.find_nodes_by_file(file);
             for (auto& node : nodes_in_file) {
                 for (auto& hunk : hunks_in_file) {
-                    // 检查行范围重叠
                     if (node.line <= hunk.line_end &&
                         (node.end_line >= hunk.line_start || node.end_line == 0)) {
                         affected_nodes[node.id] = node;
@@ -1090,7 +1232,6 @@ int main(int argc, char* argv[]) {
 
         output["impact"] = nlohmann::json::array();
         for (auto& [id, node] : impact_nodes) {
-            // 排除直接受影响的节点
             if (affected_nodes.count(id)) continue;
             output["impact"].push_back({
                 {"kind", node_kind_str(node.kind)},
@@ -1106,6 +1247,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[codegraph] " << resp_tokens << " tokens returned" << std::endl;
 
     } else if (cmd == "serve") {
+        // ── serve: 启动 MCP 服务器 ──
         bool mcp = false;
         for (int i = 2; i < argc; i++) {
             if (std::string(argv[i]) == "--mcp") mcp = true;
@@ -1121,6 +1263,7 @@ int main(int argc, char* argv[]) {
         server.run();
 
     } else if (cmd == "watch") {
+        // ── watch: 文件监听 + 自动增量索引 ──
         Database db = open_db();
         std::string path = argc > 2 ? argv[2] : ".";
         std::string abs_path = fs::absolute(path).lexically_normal().string();
@@ -1131,7 +1274,7 @@ int main(int argc, char* argv[]) {
         watcher.set_callback([&](const std::string& changed_path, uint32_t mask) {
             if (should_skip(changed_path)) return;
 
-            // Handle new directories: add watch recursively
+            // 新目录：自动添加监听
             if (mask & IN_CREATE) {
                 try {
                     if (fs::is_directory(changed_path)) {
@@ -1146,7 +1289,7 @@ int main(int argc, char* argv[]) {
             resolve_unresolved_refs(db);
         });
 
-        // Graceful shutdown on SIGINT/SIGTERM
+        // 优雅退出：SIGINT/SIGTERM 停止监听
         static std::atomic<bool> running{true};
         std::signal(SIGINT, [](int) { running = false; });
         std::signal(SIGTERM, [](int) { running = false; });
@@ -1163,5 +1306,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-// watch test
-// watch test increment

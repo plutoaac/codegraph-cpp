@@ -1,3 +1,24 @@
+/**
+ * context_builder.cpp — 上下文构建器实现
+ *
+ * 本文件是 MCP 工具和 CLI 命令的业务逻辑层，负责将数据库查询和图遍历
+ * 组合为 AI Agent 可以直接使用的结构化上下文。
+ *
+ * 核心功能：
+ *   1. search_symbols() — 符号搜索，返回匹配的节点列表
+ *   2. build_context()  — 构建符号的完整上下文（定义 + callers + callees + methods）
+ *   3. get_callers()    — 查找谁调用了某符号
+ *   4. get_callees()    — 查找某符号调用了谁
+ *   5. get_impact()     — 影响分析
+ *   6. get_status()     — 索引统计信息
+ *
+ * 设计要点：
+ *   - JSON 输出精简（只保留 kind/name/file/line/signature），减少 token 消耗
+ *   - 多候选选择：同名符号存在多个定义时，选择行范围最大的（定义 vs 前向声明）
+ *   - 类/结构体特殊处理：聚合所有方法的 callers/callees
+ *   - pick_best_node() 统一处理多候选选择逻辑
+ */
+
 #include "codegraph/context/context_builder.h"
 #include <unordered_set>
 
@@ -6,8 +27,21 @@ namespace codegraph {
 ContextBuilder::ContextBuilder(Database& db, GraphTraverser& traverser)
     : db_(db), traverser_(traverser) {}
 
+/**
+ * 将 Node 转为精简 JSON。
+ *
+ * 只保留 AI Agent 需要的 5 个字段：
+ *   - kind: 节点类型（function/class/variable 等）
+ *   - name: 符号名
+ *   - file: 所在文件路径
+ *   - line: 行号
+ *   - signature: 函数签名（可选，只在非空时包含）
+ *
+ * 为什么不返回全部 16 个字段：
+ *   AI Agent 的上下文窗口有限，精简输出可以塞进更多有用信息。
+ *   docstring、visibility、is_static 等字段对 Agent 的帮助不大。
+ */
 nlohmann::json ContextBuilder::node_to_json(const Node& node) {
-    // Compact: only 5 fields (AI needs kind+name+location+signature, not 16 fields)
     nlohmann::json j = {
         {"kind", node_kind_str(node.kind)},
         {"name", node.name},
@@ -20,8 +54,11 @@ nlohmann::json ContextBuilder::node_to_json(const Node& node) {
     return j;
 }
 
+/**
+ * 将 Edge 转为精简 JSON。
+ * 只保留 source→target+kind，省略 id、line、col 等元数据。
+ */
 nlohmann::json ContextBuilder::edge_to_json(const Edge& edge) {
-    // Compact: skip id, only source→target+kind+line
     return {
         {"src", edge.source_id},
         {"dst", edge.target_id},
@@ -29,6 +66,9 @@ nlohmann::json ContextBuilder::edge_to_json(const Edge& edge) {
     };
 }
 
+/**
+ * 符号搜索：委托给数据库的 FTS5 全文搜索。
+ */
 nlohmann::json ContextBuilder::search_symbols(const std::string& query, int limit) {
     auto nodes = db_.search_fts(query, limit);
     nlohmann::json result = nlohmann::json::array();
@@ -38,13 +78,30 @@ nlohmann::json ContextBuilder::search_symbols(const std::string& query, int limi
     return result;
 }
 
-// 构建符号的完整上下文：定义 + callers + callees + methods。
-//
-// 对于类/结构体：聚合所有方法的 callers/callees（不只是类本身的）。
-// 对于函数：直接查找 callers 和 callees。
-//
-// 多候选选择策略：当同名符号存在多个定义时（如前向声明 vs 完整定义），
-// 选择行范围最大的那个（定义通常跨越多行，前向声明只有 1-2 行）。
+/**
+ * 构建符号的完整上下文。
+ *
+ * 这是 MCP codegraph_context 工具的核心实现，返回：
+ *   - symbol: 符号本身的定义信息
+ *   - callers: 谁调用了它
+ *   - callees: 它调用了谁
+ *   - edges: 调用关系边
+ *   - methods: （类/结构体）所有方法列表
+ *
+ * 多候选选择策略：
+ *   当同名符号存在多个定义时（如前向声明 vs 完整定义），
+ *   选择行范围最大的那个（定义通常跨越多行，前向声明只有 1-2 行）。
+ *
+ * 类/结构体特殊处理：
+ *   类本身没有 call edges（调用发生在方法上），所以需要：
+ *   1. 找到类的所有方法（在同一文件和对应的 .cpp 文件中）
+ *   2. 聚合所有方法的 callers 和 callees
+ *   3. 去重后返回
+ *
+ * 对应文件查找：
+ *   如果类定义在 .h 文件中，还会查找对应的 .cpp 文件中的方法实现。
+ *   支持的头文件扩展名：.h/.hpp/.hxx/.hh
+ */
 nlohmann::json ContextBuilder::build_context(const std::string& symbol, int limit, int max_depth) {
     // 先精确匹配，再 FTS 模糊搜索
     auto nodes = db_.find_nodes_by_name(symbol, 5);
@@ -71,8 +128,8 @@ nlohmann::json ContextBuilder::build_context(const std::string& symbol, int limi
     nlohmann::json result;
     result["symbol"] = node_to_json(target);
 
-    // 对于类/结构体：聚合所有方法的 callers/callees
-    // 而不是只返回类本身的（类本身没有 call edges）
+    // ── 类/结构体特殊处理 ──
+    // 类本身没有 call edges，需要聚合所有方法的 callers/callees
     if (target.kind == NodeKind::Class || target.kind == NodeKind::Struct) {
         // 在类所在文件和对应的 .cpp 文件中查找所有属于该类的方法
         std::vector<Node> class_methods;
@@ -88,7 +145,7 @@ nlohmann::json ContextBuilder::build_context(const std::string& symbol, int limi
 
         add_methods_from_file(target.file_path);
 
-        // Also search corresponding source file if class is in a header
+        // 如果类在头文件中，还要查找对应的源文件
         auto try_add_source = [&](const std::string& header_ext, const std::string& source_ext) {
             if (target.file_path.size() >= header_ext.size() &&
                 target.file_path.substr(target.file_path.size() - header_ext.size()) == header_ext) {
@@ -101,13 +158,13 @@ nlohmann::json ContextBuilder::build_context(const std::string& symbol, int limi
         try_add_source(".hxx", ".cxx");
         try_add_source(".hh", ".cc");
 
-        // Aggregate callers and callees from all methods
+        // 聚合所有方法的 callers 和 callees
         std::unordered_map<int64_t, Node> caller_nodes, callee_nodes;
         std::unordered_set<int64_t> seen_edge_ids;
         nlohmann::json edges_json = nlohmann::json::array();
 
         for (auto& method : class_methods) {
-            // Limit methods to process (avoid huge output for large classes)
+            // 限制处理的方法数，避免大类输出过多
             if (caller_nodes.size() >= static_cast<size_t>(limit) &&
                 callee_nodes.size() >= static_cast<size_t>(limit)) {
                 break;
@@ -119,6 +176,7 @@ nlohmann::json ContextBuilder::build_context(const std::string& symbol, int limi
             for (auto& n : callers.nodes) caller_nodes[n.id] = n;
             for (auto& n : callees.nodes) callee_nodes[n.id] = n;
 
+            // 边去重（callers 和 callees 可能共享边）
             auto add_edge = [&](const Edge& e) {
                 if (seen_edge_ids.insert(e.id).second) {
                     edges_json.push_back(edge_to_json(e));
@@ -128,7 +186,7 @@ nlohmann::json ContextBuilder::build_context(const std::string& symbol, int limi
             for (auto& e : callees.edges) add_edge(e);
         }
 
-        // Apply limit to callers and callees
+        // 应用 limit
         result["callers"] = nlohmann::json::array();
         int caller_count = 0;
         for (auto& [id, n] : caller_nodes) {
@@ -149,11 +207,10 @@ nlohmann::json ContextBuilder::build_context(const std::string& symbol, int limi
             result["methods"].push_back(node_to_json(m));
         }
     } else {
-        // For functions/methods, get callers and callees directly
+        // ── 函数/方法：直接查找 callers 和 callees ──
         auto callers = traverser_.get_callers(target.id, max_depth);
         auto callees = traverser_.get_callees(target.id, max_depth);
 
-        // Apply limit to callers and callees
         result["callers"] = nlohmann::json::array();
         int caller_count = 0;
         for (auto& n : callers.nodes) {
@@ -168,7 +225,7 @@ nlohmann::json ContextBuilder::build_context(const std::string& symbol, int limi
             result["callees"].push_back(node_to_json(n));
         }
 
-        // Deduplicate edges
+        // 边去重
         std::unordered_set<int64_t> seen_edge_ids;
         result["edges"] = nlohmann::json::array();
         auto add_edge = [&](const Edge& e) {
@@ -183,8 +240,13 @@ nlohmann::json ContextBuilder::build_context(const std::string& symbol, int limi
     return result;
 }
 
-// Pick the best node from candidates: prefer definitions over forward declarations
-// by selecting the one with the largest line span.
+/**
+ * 从多个候选节点中选择最佳的一个。
+ *
+ * 策略：选择行范围最大的（end_line - line）。
+ * 原因：定义通常跨越多行（函数实现、类定义），
+ *       前向声明只有 1-2 行。
+ */
 static const Node& pick_best_node(const std::vector<Node>& nodes) {
     int best_idx = 0;
     int best_span = 0;
@@ -198,6 +260,10 @@ static const Node& pick_best_node(const std::vector<Node>& nodes) {
     return nodes[best_idx];
 }
 
+/**
+ * 查找谁调用了某符号。
+ * 流程：按名字查找节点 → 选择最佳候选 → 调用图遍历。
+ */
 nlohmann::json ContextBuilder::get_callers(const std::string& symbol, int max_depth) {
     auto nodes = db_.find_nodes_by_name(symbol, 5);
     if (nodes.empty()) {
@@ -217,6 +283,9 @@ nlohmann::json ContextBuilder::get_callers(const std::string& symbol, int max_de
     return json_result;
 }
 
+/**
+ * 查找某符号调用了谁。
+ */
 nlohmann::json ContextBuilder::get_callees(const std::string& symbol, int max_depth) {
     auto nodes = db_.find_nodes_by_name(symbol, 5);
     if (nodes.empty()) {
@@ -236,6 +305,9 @@ nlohmann::json ContextBuilder::get_callees(const std::string& symbol, int max_de
     return json_result;
 }
 
+/**
+ * 影响分析：改某符号会影响谁。
+ */
 nlohmann::json ContextBuilder::get_impact(const std::string& symbol, int max_depth) {
     auto nodes = db_.find_nodes_by_name(symbol, 5);
     if (nodes.empty()) {
@@ -255,6 +327,9 @@ nlohmann::json ContextBuilder::get_impact(const std::string& symbol, int max_dep
     return json_result;
 }
 
+/**
+ * 获取索引统计信息。
+ */
 nlohmann::json ContextBuilder::get_status() {
     return {
         {"node_count", db_.count_nodes()},

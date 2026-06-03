@@ -1,7 +1,32 @@
+/**
+ * types.cpp — 类型枚举的字符串转换实现
+ *
+ * 本文件提供 NodeKind 和 EdgeKind 到字符串的映射，
+ * 用于 JSON 序列化、日志输出和 DOT 图导出。
+ *
+ * 设计要点：
+ *   - 使用 switch-case 而非 map，避免运行时哈希开销
+ *   - 枚举值和字符串的对应关系必须与 types.h 中的定义严格一致
+ *   - 返回 "unknown" 作为兜底，确保不会因未知枚举值崩溃
+ */
+
 #include "codegraph/core/types.h"
 
 namespace codegraph {
 
+/**
+ * NodeKind → 字符串
+ *
+ * 用途：
+ *   - JSON 输出中的 "kind" 字段（如 {"kind": "function"}）
+ *   - DOT 图中的节点标签
+ *   - CLI 输出中的类型标识
+ *
+ * 枚举值定义见 types.h：
+ *   File=0, Function=1, Method=2, Class=3, Struct=4,
+ *   Enum=5, EnumMember=6, Variable=7, TypeAlias=8,
+ *   Namespace=9, Import=10, Parameter=11, Field=12
+ */
 const char* node_kind_str(NodeKind kind) {
     switch (kind) {
         case NodeKind::File:       return "file";
@@ -21,6 +46,18 @@ const char* node_kind_str(NodeKind kind) {
     return "unknown";
 }
 
+/**
+ * EdgeKind → 字符串
+ *
+ * 用途：
+ *   - JSON 输出中的 "kind" 字段（如 {"kind": "calls"}）
+ *   - DOT 图中的边标签
+ *
+ * 枚举值定义见 types.h：
+ *   Contains=0, Calls=1, Imports=2, Exports=3,
+ *   Extends=4, Implements=5, References=6,
+ *   TypeOf=7, Returns=8, Overrides=9
+ */
 const char* edge_kind_str(EdgeKind kind) {
     switch (kind) {
         case EdgeKind::Contains:   return "contains";

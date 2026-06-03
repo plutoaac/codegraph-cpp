@@ -1,3 +1,30 @@
+/**
+ * mcp_server.cpp — MCP（Model Context Protocol）服务器实现
+ *
+ * 本文件实现了 JSON-RPC 2.0 协议的 MCP 服务器，让 AI Agent
+ * 可以通过标准协议调用 codegraph 的代码分析能力。
+ *
+ * MCP 协议简介：
+ *   - 基于 JSON-RPC 2.0（stdin/stdout 通信）
+ *   - AI Agent 发送请求（如 tools/call），服务器返回结果
+ *   - 支持工具发现（tools/list）、初始化握手（initialize）
+ *
+ * 暴露的 MCP 工具（共 10 个）：
+ *   1. codegraph_search         — 符号搜索
+ *   2. codegraph_context        — 符号上下文（定义 + callers + callees）
+ *   3. codegraph_callers        — 查找谁调用了某符号
+ *   4. codegraph_callees        — 查找某符号调用了谁
+ *   5. codegraph_impact         — 影响分析
+ *   6. codegraph_node           — 符号详情
+ *   7. codegraph_status         — 索引统计
+ *   8. codegraph_files          — 已索引文件列表
+ *   9. codegraph_search_semantic — 语义搜索（需要 Python embed）
+ *  10. codegraph_change_impact  — git diff 影响分析
+ *
+ * 通信流程：
+ *   AI Agent → stdin → McpServer::run() → handle_request() → stdout → AI Agent
+ */
+
 #include "codegraph/mcp/mcp_server.h"
 #include "codegraph/diff/diff_parser.h"
 #include <cerrno>
@@ -14,6 +41,18 @@ namespace codegraph {
 McpServer::McpServer(Database& db, GraphTraverser& traverser, ContextBuilder& context)
     : db_(db), traverser_(traverser), context_(context) {}
 
+/**
+ * 主循环：从 stdin 逐行读取 JSON-RPC 请求，处理后输出到 stdout。
+ *
+ * 协议格式：
+ *   请求：{"jsonrpc":"2.0","method":"tools/call","params":{...},"id":1}
+ *   响应：{"jsonrpc":"2.0","result":{...},"id":1}
+ *   错误：{"jsonrpc":"2.0","error":{"code":-32700,"message":"..."},"id":null}
+ *
+ * JSON-RPC 通知（无 id 字段）：
+ *   如 notifications/initialized，不需要返回响应。
+ *   通过 __notification__ 标记跳过输出。
+ */
 void McpServer::run() {
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -31,13 +70,22 @@ void McpServer::run() {
             };
         }
 
-        // Skip response for JSON-RPC notifications (no id field).
+        // JSON-RPC 通知（无 id）不返回响应
         if (response.contains("__notification__")) continue;
 
         std::cout << response.dump() << std::endl;
     }
 }
 
+/**
+ * 请求路由：根据 method 字段分发到对应的处理函数。
+ *
+ * 支持的 method：
+ *   - initialize: 协议握手，返回服务器信息和能力
+ *   - tools/list: 返回可用工具列表
+ *   - tools/call: 调用指定工具
+ *   - notifications/initialized: 客户端初始化完成通知（无响应）
+ */
 nlohmann::json McpServer::handle_request(const nlohmann::json& request) {
     std::string method = request.value("method", "");
     auto id = request.contains("id") ? request["id"] : nlohmann::json(nullptr);
@@ -52,7 +100,7 @@ nlohmann::json McpServer::handle_request(const nlohmann::json& request) {
     } else if (method == "tools/call") {
         result = handle_tools_call(params);
     } else if (method == "notifications/initialized") {
-        // JSON-RPC notifications have no id — do not send a response.
+        // JSON-RPC 通知：不返回响应
         return {{"__notification__", true}};
     } else {
         return {
@@ -69,6 +117,10 @@ nlohmann::json McpServer::handle_request(const nlohmann::json& request) {
     };
 }
 
+/**
+ * 处理 initialize 请求：返回协议版本和服务器能力。
+ * 这是 MCP 握手的第一步，客户端确认服务器支持的功能。
+ */
 nlohmann::json McpServer::handle_initialize(const nlohmann::json&) {
     return {
         {"protocolVersion", "2024-11-05"},
@@ -77,6 +129,19 @@ nlohmann::json McpServer::handle_initialize(const nlohmann::json&) {
     };
 }
 
+/**
+ * 返回可用工具列表。
+ *
+ * 每个工具包含：
+ *   - name: 工具名（AI Agent 调用时使用）
+ *   - description: 工具描述（AI Agent 用于理解工具用途）
+ *   - inputSchema: 参数的 JSON Schema（AI Agent 用于构造参数）
+ *
+ * description 的设计要点：
+ *   - 明确说明工具的用途和使用场景
+ *   - 提示何时应该使用这个工具
+ *   - 说明参数的含义和默认值
+ */
 nlohmann::json McpServer::handle_tools_list() {
     return {
         {"tools", nlohmann::json::array({
@@ -194,6 +259,9 @@ nlohmann::json McpServer::handle_tools_list() {
     };
 }
 
+/**
+ * 工具调用路由：根据工具名分发到对应的实现函数。
+ */
 nlohmann::json McpServer::handle_tools_call(const nlohmann::json& params) {
     std::string tool_name = params.value("name", "");
     auto args = params.value("arguments", nlohmann::json::object());
@@ -212,8 +280,9 @@ nlohmann::json McpServer::handle_tools_call(const nlohmann::json& params) {
     return make_error("Unknown tool: " + tool_name);
 }
 
-// ── Tool implementations ──
+// ── 工具实现 ──
 
+/** 符号搜索：委托给 ContextBuilder::search_symbols()。 */
 nlohmann::json McpServer::tool_search(const nlohmann::json& args) {
     std::string query = args.value("query", "");
     int limit = args.value("limit", 20);
@@ -221,6 +290,7 @@ nlohmann::json McpServer::tool_search(const nlohmann::json& args) {
     return make_result(results.dump());
 }
 
+/** 符号上下文：委托给 ContextBuilder::build_context()。 */
 nlohmann::json McpServer::tool_context(const nlohmann::json& args) {
     std::string symbol = args.value("symbol", "");
     int limit = args.value("limit", 10);
@@ -229,6 +299,7 @@ nlohmann::json McpServer::tool_context(const nlohmann::json& args) {
     return make_result(results.dump());
 }
 
+/** callers 查询。 */
 nlohmann::json McpServer::tool_callers(const nlohmann::json& args) {
     std::string symbol = args.value("symbol", "");
     int max_depth = args.value("max_depth", 3);
@@ -236,6 +307,7 @@ nlohmann::json McpServer::tool_callers(const nlohmann::json& args) {
     return make_result(results.dump());
 }
 
+/** callees 查询。 */
 nlohmann::json McpServer::tool_callees(const nlohmann::json& args) {
     std::string symbol = args.value("symbol", "");
     int max_depth = args.value("max_depth", 3);
@@ -243,6 +315,7 @@ nlohmann::json McpServer::tool_callees(const nlohmann::json& args) {
     return make_result(results.dump());
 }
 
+/** 影响分析。 */
 nlohmann::json McpServer::tool_impact(const nlohmann::json& args) {
     std::string symbol = args.value("symbol", "");
     int max_depth = args.value("max_depth", 5);
@@ -250,6 +323,10 @@ nlohmann::json McpServer::tool_impact(const nlohmann::json& args) {
     return make_result(results.dump());
 }
 
+/**
+ * 符号详情：返回单个符号的完整信息。
+ * 与 context 不同，这里只返回符号本身，不遍历图。
+ */
 nlohmann::json McpServer::tool_node(const nlohmann::json& args) {
     std::string symbol = args.value("symbol", "");
     auto nodes = db_.find_nodes_by_name(symbol, 1);
@@ -265,10 +342,12 @@ nlohmann::json McpServer::tool_node(const nlohmann::json& args) {
     return make_result(node_json.dump());
 }
 
+/** 索引统计。 */
 nlohmann::json McpServer::tool_status(const nlohmann::json&) {
     return make_result(context_.get_status().dump());
 }
 
+/** 已索引文件列表。 */
 nlohmann::json McpServer::tool_files(const nlohmann::json&) {
     auto files = db_.get_all_files();
     nlohmann::json result = nlohmann::json::array();
@@ -278,6 +357,16 @@ nlohmann::json McpServer::tool_files(const nlohmann::json&) {
     return make_result(result.dump());
 }
 
+/**
+ * Git diff 影响分析。
+ *
+ * 流程：
+ *   1. 执行 git diff 获取变更
+ *   2. 解析 diff 输出，提取变更的文件和行范围
+ *   3. 找到行范围内的受影响符号
+ *   4. 对每个受影响符号运行影响分析
+ *   5. 返回变更文件、直接受影响符号、间接受影响符号
+ */
 nlohmann::json McpServer::tool_diff(const nlohmann::json& args) {
     std::string ref = args.value("ref", "");
     std::string diff_output = run_git_diff(ref);
@@ -297,10 +386,12 @@ nlohmann::json McpServer::tool_diff(const nlohmann::json& args) {
         file_hunks[h.file_path].push_back(h);
     }
 
+    // 找到行范围内的符号
     for (auto& [file, hunks_in_file] : file_hunks) {
         auto nodes_in_file = db_.find_nodes_by_file(file);
         for (auto& node : nodes_in_file) {
             for (auto& hunk : hunks_in_file) {
+                // 检查行范围重叠
                 if (node.line <= hunk.line_end &&
                     (node.end_line >= hunk.line_start || node.end_line == 0)) {
                     affected_nodes[node.id] = node;
@@ -355,6 +446,14 @@ nlohmann::json McpServer::tool_diff(const nlohmann::json& args) {
     return make_result(output.dump());
 }
 
+/**
+ * 语义搜索：调用 Python embed.py 脚本。
+ *
+ * 为什么用 fork+exec 而不是嵌入 Python：
+ *   - 避免 C++ 项目依赖 Python 头文件
+ *   - sentence-transformers 库只在需要时安装
+ *   - 进程隔离，Python 崩溃不影响 C++ 服务器
+ */
 nlohmann::json McpServer::tool_semantic_search(const nlohmann::json& args) {
     std::string query = args.value("query", "");
     int limit = args.value("limit", 10);
@@ -363,16 +462,13 @@ nlohmann::json McpServer::tool_semantic_search(const nlohmann::json& args) {
         return make_error("query is required");
     }
 
-    // Find embed.py relative to the codegraph binary or in source tree
     std::string script_path = "scripts/embed.py";
     std::string db_path = ".codegraph/index";
 
-    // Try to find the database
     if (!std::filesystem::exists(db_path)) {
         return make_error("No .codegraph/index found. Run 'codegraph init' first.");
     }
 
-    // Build command: python3 embed.py query <db_path> "<query>" <limit>
     std::vector<std::string> argv_strs = {
         "python3", script_path, "query", db_path, query, std::to_string(limit)
     };
@@ -427,6 +523,7 @@ nlohmann::json McpServer::tool_semantic_search(const nlohmann::json& args) {
     return make_result(result);
 }
 
+/** 构造成功的 MCP 响应。 */
 nlohmann::json McpServer::make_result(const std::string& text) {
     return {
         {"content", nlohmann::json::array({
@@ -435,6 +532,7 @@ nlohmann::json McpServer::make_result(const std::string& text) {
     };
 }
 
+/** 构造错误的 MCP 响应。 */
 nlohmann::json McpServer::make_error(const std::string& message) {
     return {
         {"content", nlohmann::json::array({

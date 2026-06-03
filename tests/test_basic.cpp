@@ -5,13 +5,14 @@
 #include "codegraph/graph/traverser.h"
 #include "codegraph/context/context_builder.h"
 
-#include <cassert>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <sys/wait.h>
 #include <thread>
@@ -22,17 +23,71 @@
 using namespace codegraph;
 namespace fs = std::filesystem;
 
+namespace {
+
+[[noreturn]] void fail_check(const char* expr, const char* file, int line) {
+    std::ostringstream msg;
+    msg << file << ":" << line << ": check failed: " << expr;
+    throw std::runtime_error(msg.str());
+}
+
+#define CHECK(expr) \
+    do { \
+        if (!(expr)) fail_check(#expr, __FILE__, __LINE__); \
+    } while (false)
+
+std::string temp_db_path(const std::string& name) {
+    return (fs::temp_directory_path() /
+            ("codegraph_test_" + std::to_string(getpid()) + "_" + name)).string();
+}
+
+void remove_db_files(const std::string& path) {
+    fs::remove_all(path);
+    fs::remove_all(path + "-wal");
+    fs::remove_all(path + "-shm");
+}
+
+struct TempDb {
+    explicit TempDb(const std::string& name) : path(temp_db_path(name)) {
+        remove_db_files(path);
+    }
+
+    ~TempDb() {
+        remove_db_files(path);
+    }
+
+    std::string path;
+};
+
+fs::path find_codegraph_exe() {
+    const fs::path cwd = fs::current_path();
+    const std::vector<fs::path> candidates = {
+        cwd / "build" / "codegraph",
+        cwd / "codegraph",
+        cwd.parent_path() / "codegraph"
+    };
+
+    for (const auto& candidate : candidates) {
+        if (fs::exists(candidate) && fs::is_regular_file(candidate)) {
+            return fs::absolute(candidate);
+        }
+    }
+
+    throw std::runtime_error("Cannot find codegraph executable. Build target 'codegraph' first.");
+}
+
+}  // namespace
+
 void test_types() {
-    assert(strcmp(node_kind_str(NodeKind::Function), "function") == 0);
-    assert(strcmp(edge_kind_str(EdgeKind::Calls), "calls") == 0);
+    CHECK(strcmp(node_kind_str(NodeKind::Function), "function") == 0);
+    CHECK(strcmp(edge_kind_str(EdgeKind::Calls), "calls") == 0);
     std::cout << "  [PASS] types\n";
 }
 
 void test_database() {
-    const char* path = "/tmp/test_codegraph.db";
-    std::remove(path);
+    TempDb temp_db("database.db");
 
-    Database db(path);
+    Database db(temp_db.path);
     db.init_schema();
 
     Node n;
@@ -47,12 +102,12 @@ void test_database() {
     n.end_col = 1;
     n.signature = "void test_func(int x)";
     int64_t id = db.insert_node(n);
-    assert(id > 0);
+    CHECK(id > 0);
 
     auto got = db.get_node(id);
-    assert(got.has_value());
-    assert(got->name == "test_func");
-    assert(got->kind == NodeKind::Function);
+    CHECK(got.has_value());
+    CHECK(got->name == "test_func");
+    CHECK(got->kind == NodeKind::Function);
 
     Node n2;
     n2.kind = NodeKind::Function;
@@ -67,30 +122,28 @@ void test_database() {
     e.kind = EdgeKind::Calls;
     e.line = 15;
     int64_t eid = db.insert_edge(e);
-    assert(eid > 0);
+    CHECK(eid > 0);
 
     auto callers = db.get_edges_to(id, EdgeKind::Calls);
-    assert(callers.size() == 1);
-    assert(callers[0].source_id == id2);
+    CHECK(callers.size() == 1);
+    CHECK(callers[0].source_id == id2);
 
     auto results = db.search_fts("test_func");
-    assert(!results.empty());
+    CHECK(!results.empty());
 
     auto qualified_results = db.search_fts("ns::test_func");
-    assert(!qualified_results.empty());
+    CHECK(!qualified_results.empty());
 
-    assert(db.count_nodes() == 2);
-    assert(db.count_edges() == 1);
+    CHECK(db.count_nodes() == 2);
+    CHECK(db.count_edges() == 1);
 
-    std::remove(path);
     std::cout << "  [PASS] database\n";
 }
 
 void test_database_lookup_and_errors() {
-    const char* path = "/tmp/test_codegraph_lookup.db";
-    std::remove(path);
+    TempDb temp_db("database_lookup.db");
 
-    Database db(path);
+    Database db(temp_db.path);
     db.init_schema();
 
     Node exact;
@@ -100,7 +153,7 @@ void test_database_lookup_and_errors() {
     exact.file_path = "/tmp/a.cpp";
     exact.language = "cpp";
     int64_t exact_id = db.insert_node(exact);
-    assert(exact_id > 0);
+    CHECK(exact_id > 0);
 
     Node fuzzy;
     fuzzy.kind = NodeKind::Function;
@@ -109,17 +162,17 @@ void test_database_lookup_and_errors() {
     fuzzy.file_path = "/tmp/b.cpp";
     fuzzy.language = "cpp";
     int64_t fuzzy_id = db.insert_node(fuzzy);
-    assert(fuzzy_id > 0);
+    CHECK(fuzzy_id > 0);
 
     auto exact_results = db.find_nodes_by_name("foo", 1);
-    assert(exact_results.size() == 1);
-    assert(exact_results[0].id == exact_id);
+    CHECK(exact_results.size() == 1);
+    CHECK(exact_results[0].id == exact_id);
 
     Edge invalid;
     invalid.source_id = 999999;
     invalid.target_id = exact_id;
     invalid.kind = EdgeKind::Calls;
-    assert(db.insert_edge(invalid) < 0);
+    CHECK(db.insert_edge(invalid) < 0);
 
     bool batch_failed = false;
     try {
@@ -127,9 +180,8 @@ void test_database_lookup_and_errors() {
     } catch (const std::runtime_error&) {
         batch_failed = true;
     }
-    assert(batch_failed);
+    CHECK(batch_failed);
 
-    std::remove(path);
     std::cout << "  [PASS] database_lookup_and_errors\n";
 }
 
@@ -153,7 +205,7 @@ namespace math {
 )";
 
     auto result = extractor.extract("/tmp/test.cpp", source);
-    assert(!result.nodes.empty());
+    CHECK(!result.nodes.empty());
 
     bool found_add = false, found_calc = false, found_multiply = false;
     bool found_qualified_add = false, found_qualified_multiply = false;
@@ -164,11 +216,11 @@ namespace math {
         if (n.qualified_name == "math::add") found_qualified_add = true;
         if (n.qualified_name == "math::Calculator::multiply") found_qualified_multiply = true;
     }
-    assert(found_add);
-    assert(found_calc);
-    assert(found_multiply);
-    assert(found_qualified_add);
-    assert(found_qualified_multiply);
+    CHECK(found_add);
+    CHECK(found_calc);
+    CHECK(found_multiply);
+    CHECK(found_qualified_add);
+    CHECK(found_qualified_multiply);
 
     std::cout << "  [PASS] cpp_extractor (" << result.nodes.size() << " nodes)\n";
 }
@@ -203,9 +255,9 @@ namespace math {
         calls.insert(ref.ref_name);
     }
 
-    assert(calls.count("add") > 0);
-    assert(calls.count("reset") > 0);
-    assert(calls.count("get") > 0);
+    CHECK(calls.count("add") > 0);
+    CHECK(calls.count("reset") > 0);
+    CHECK(calls.count("get") > 0);
     std::cout << "  [PASS] cpp_member_call_extraction\n";
 }
 
@@ -216,7 +268,7 @@ void test_run_git_diff_does_not_execute_shell() {
     (void)run_git_diff(std::string("HEAD; touch ") + marker);
 
     FILE* file = std::fopen(marker, "r");
-    assert(file == nullptr);
+    CHECK(file == nullptr);
     if (file != nullptr) {
         std::fclose(file);
         std::remove(marker);
@@ -226,10 +278,9 @@ void test_run_git_diff_does_not_execute_shell() {
 }
 
 void test_context_builder_splits_callers_and_callees() {
-    const char* path = "/tmp/test_codegraph_context.db";
-    std::remove(path);
+    TempDb temp_db("context.db");
 
-    Database db(path);
+    Database db(temp_db.path);
     db.init_schema();
 
     Node caller;
@@ -257,26 +308,25 @@ void test_context_builder_splits_callers_and_callees() {
     caller_edge.source_id = caller_id;
     caller_edge.target_id = target_id;
     caller_edge.kind = EdgeKind::Calls;
-    assert(db.insert_edge(caller_edge) > 0);
+    CHECK(db.insert_edge(caller_edge) > 0);
 
     Edge callee_edge;
     callee_edge.source_id = target_id;
     callee_edge.target_id = callee_id;
     callee_edge.kind = EdgeKind::Calls;
-    assert(db.insert_edge(callee_edge) > 0);
+    CHECK(db.insert_edge(callee_edge) > 0);
 
     GraphTraverser traverser(db);
     ContextBuilder context(db, traverser);
     auto result = context.build_context("target");
 
-    assert(result.contains("callers"));
-    assert(result.contains("callees"));
-    assert(result["callers"].size() == 1);
-    assert(result["callees"].size() == 1);
-    assert(result["callers"][0]["name"] == "caller");
-    assert(result["callees"][0]["name"] == "callee");
+    CHECK(result.contains("callers"));
+    CHECK(result.contains("callees"));
+    CHECK(result["callers"].size() == 1);
+    CHECK(result["callees"].size() == 1);
+    CHECK(result["callers"][0]["name"] == "caller");
+    CHECK(result["callees"][0]["name"] == "callee");
 
-    std::remove(path);
     std::cout << "  [PASS] context_builder_splits_callers_and_callees\n";
 }
 
@@ -295,15 +345,15 @@ class Greeter:
 )";
 
     auto result = extractor.extract("/tmp/test.py", source);
-    assert(!result.nodes.empty());
+    CHECK(!result.nodes.empty());
 
     bool found_hello = false, found_greeter = false;
     for (auto& n : result.nodes) {
         if (n.name == "hello") found_hello = true;
         if (n.name == "Greeter") found_greeter = true;
     }
-    assert(found_hello);
-    assert(found_greeter);
+    CHECK(found_hello);
+    CHECK(found_greeter);
 
     std::cout << "  [PASS] python_extractor (" << result.nodes.size() << " nodes)\n";
 }
@@ -319,37 +369,37 @@ def bar():
 )";
 
     auto result = extractor.extract("/tmp/test_calls.py", source);
-    assert(!result.unresolved.empty());
+    CHECK(!result.unresolved.empty());
 
     bool found_bar_call = false, found_foo_call = false;
     for (auto& ref : result.unresolved) {
         if (ref.ref_name == "bar") found_bar_call = true;
         if (ref.ref_name == "foo") found_foo_call = true;
     }
-    assert(found_bar_call);
-    assert(found_foo_call);
+    CHECK(found_bar_call);
+    CHECK(found_foo_call);
     std::cout << "  [PASS] python_call_extraction\n";
 }
 
 void test_detect_language() {
-    assert(detect_language("foo.cpp") == "cpp");
-    assert(detect_language("foo.cc") == "cpp");
-    assert(detect_language("foo.cxx") == "cpp");
-    assert(detect_language("foo.c") == "cpp");
-    assert(detect_language("foo.h") == "cpp");
-    assert(detect_language("foo.hpp") == "cpp");
-    assert(detect_language("foo.hxx") == "cpp");
-    assert(detect_language("foo.hh") == "cpp");
-    assert(detect_language("foo.py") == "python");
-    assert(detect_language("foo.pyi") == "python");
-    assert(detect_language("foo.txt") == "");
-    assert(detect_language("foo.rs") == "");
+    CHECK(detect_language("foo.cpp") == "cpp");
+    CHECK(detect_language("foo.cc") == "cpp");
+    CHECK(detect_language("foo.cxx") == "cpp");
+    CHECK(detect_language("foo.c") == "cpp");
+    CHECK(detect_language("foo.h") == "cpp");
+    CHECK(detect_language("foo.hpp") == "cpp");
+    CHECK(detect_language("foo.hxx") == "cpp");
+    CHECK(detect_language("foo.hh") == "cpp");
+    CHECK(detect_language("foo.py") == "python");
+    CHECK(detect_language("foo.pyi") == "python");
+    CHECK(detect_language("foo.txt") == "");
+    CHECK(detect_language("foo.rs") == "");
     std::cout << "  [PASS] detect_language\n";
 }
 
 int run_codegraph_cli(const fs::path& exe, const fs::path& cwd, const std::vector<std::string>& args) {
     pid_t pid = fork();
-    assert(pid >= 0);
+    CHECK(pid >= 0);
     if (pid == 0) {
         if (chdir(cwd.c_str()) != 0) {
             _exit(127);
@@ -374,15 +424,16 @@ int run_codegraph_cli(const fs::path& exe, const fs::path& cwd, const std::vecto
 
     int status = 0;
     while (waitpid(pid, &status, 0) < 0) {
-        assert(errno == EINTR);
+        if (errno != EINTR) {
+            return 1;
+        }
     }
     if (!WIFEXITED(status)) return 1;
     return WEXITSTATUS(status);
 }
 
 void test_incremental_reindex() {
-    const fs::path exe = fs::current_path() / "codegraph";
-    assert(fs::exists(exe));
+    const fs::path exe = find_codegraph_exe();
 
     const fs::path root = fs::path("/tmp") / ("codegraph_incremental_cli_" + std::to_string(getpid()));
     fs::remove_all(root);
@@ -404,18 +455,18 @@ void test_incremental_reindex() {
         out << "void stable() {}\n";
     }
 
-    assert(run_codegraph_cli(exe, root, {"init", "-i", root.string()}) == 0);
+    CHECK(run_codegraph_cli(exe, root, {"init", "-i", root.string()}) == 0);
 
     const fs::path db_path = root / ".codegraph" / "index";
     int64_t stable_id_before = 0;
     {
         Database db(db_path.string());
         auto stable_nodes = db.find_nodes_by_name("stable", 5);
-        assert(stable_nodes.size() == 1);
+        CHECK(stable_nodes.size() == 1);
         stable_id_before = stable_nodes[0].id;
-        assert(!db.find_nodes_by_name("alpha", 5).empty());
-        assert(!db.find_nodes_by_name("beta", 5).empty());
-        assert(!db.find_nodes_by_name("external", 5).empty());
+        CHECK(!db.find_nodes_by_name("alpha", 5).empty());
+        CHECK(!db.find_nodes_by_name("beta", 5).empty());
+        CHECK(!db.find_nodes_by_name("external", 5).empty());
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
@@ -424,23 +475,23 @@ void test_incremental_reindex() {
         out << "void gamma() {}\n";
     }
 
-    assert(run_codegraph_cli(exe, root, {"index", root.string()}) == 0);
+    CHECK(run_codegraph_cli(exe, root, {"index", root.string()}) == 0);
 
     {
         Database db(db_path.string());
         auto gamma_nodes = db.find_nodes_by_name("gamma", 5);
-        assert(gamma_nodes.size() == 1);
-        assert(gamma_nodes[0].file_path == changed_file.string());
+        CHECK(gamma_nodes.size() == 1);
+        CHECK(gamma_nodes[0].file_path == changed_file.string());
 
         auto stable_nodes = db.find_nodes_by_name("stable", 5);
-        assert(stable_nodes.size() == 1);
-        assert(stable_nodes[0].id == stable_id_before);
+        CHECK(stable_nodes.size() == 1);
+        CHECK(stable_nodes[0].id == stable_id_before);
 
         for (const auto& n : db.find_nodes_by_name("alpha", 5)) {
-            assert(n.file_path != changed_file.string());
+            CHECK(n.file_path != changed_file.string());
         }
         for (const auto& n : db.find_nodes_by_name("beta", 5)) {
-            assert(n.file_path != changed_file.string());
+            CHECK(n.file_path != changed_file.string());
         }
 
         bool found_unresolved_alpha_from_caller = false;
@@ -452,7 +503,7 @@ void test_incremental_reindex() {
                 break;
             }
         }
-        assert(found_unresolved_alpha_from_caller);
+        CHECK(found_unresolved_alpha_from_caller);
     }
 
     fs::remove_all(root);
@@ -460,8 +511,7 @@ void test_incremental_reindex() {
 }
 
 void test_context_aware_same_name_resolution() {
-    const fs::path exe = fs::current_path() / "codegraph";
-    assert(fs::exists(exe));
+    const fs::path exe = find_codegraph_exe();
 
     const fs::path root = fs::path("/tmp") / ("codegraph_same_name_" + std::to_string(getpid()));
     fs::remove_all(root);
@@ -479,19 +529,19 @@ void test_context_aware_same_name_resolution() {
         out << "void WaitServerReady() {}\n";
     }
 
-    assert(run_codegraph_cli(exe, root, {"init", "-i", root.string()}) == 0);
+    CHECK(run_codegraph_cli(exe, root, {"init", "-i", root.string()}) == 0);
 
     {
         Database db((root / ".codegraph" / "index").string());
         auto uses = db.find_nodes_by_name("Use", 5);
-        assert(uses.size() == 1);
+        CHECK(uses.size() == 1);
 
         auto calls = db.get_edges_from(uses[0].id, EdgeKind::Calls);
         bool found_local_target = false;
         bool found_wrong_target = false;
         for (const auto& edge : calls) {
             auto target = db.get_node(edge.target_id);
-            assert(target.has_value());
+            CHECK(target.has_value());
             if (target->name == "WaitServerReady" && target->file_path == local_file.string()) {
                 found_local_target = true;
             }
@@ -500,8 +550,8 @@ void test_context_aware_same_name_resolution() {
             }
         }
 
-        assert(found_local_target);
-        assert(!found_wrong_target);
+        CHECK(found_local_target);
+        CHECK(!found_wrong_target);
     }
 
     fs::remove_all(root);
@@ -509,10 +559,9 @@ void test_context_aware_same_name_resolution() {
 }
 
 void test_tarjan_scc() {
-    const char* path = "/tmp/test_codegraph_scc.db";
-    std::remove(path);
+    TempDb temp_db("scc.db");
 
-    Database db(path);
+    Database db(temp_db.path);
     db.init_schema();
 
     // Register the file so get_all_files() finds it
@@ -557,22 +606,20 @@ void test_tarjan_scc() {
             }
         }
     }
-    assert(found_cycle);
+    CHECK(found_cycle);
 
     // Find circular dependencies (SCCs with size > 1)
     auto cycles = traverser.find_circular_dependencies();
-    assert(cycles.size() == 1);
-    assert(cycles[0].size() == 3);
+    CHECK(cycles.size() == 1);
+    CHECK(cycles[0].size() == 3);
 
-    std::remove(path);
     std::cout << "  [PASS] tarjan_scc\n";
 }
 
 void test_find_path() {
-    const char* path = "/tmp/test_codegraph_path.db";
-    std::remove(path);
+    TempDb temp_db("path.db");
 
-    Database db(path);
+    Database db(temp_db.path);
     db.init_schema();
 
     // A -> B -> C -> D, 有路径 A→D
@@ -595,28 +642,26 @@ void test_find_path() {
 
     // 有路径：A → B → C → D
     auto p = traverser.find_path(aid, did);
-    assert(p.size() == 4);
-    assert(p[0] == aid);
-    assert(p[3] == did);
+    CHECK(p.size() == 4);
+    CHECK(p[0] == aid);
+    CHECK(p[3] == did);
 
     // 无反向路径：D → A
     auto no_path = traverser.find_path(did, aid);
-    assert(no_path.empty());
+    CHECK(no_path.empty());
 
     // 自身到自身
     auto self = traverser.find_path(aid, aid);
-    assert(self.size() == 1);
-    assert(self[0] == aid);
+    CHECK(self.size() == 1);
+    CHECK(self[0] == aid);
 
-    std::remove(path);
     std::cout << "  [PASS] find_path\n";
 }
 
 void test_compute_metrics() {
-    const char* path = "/tmp/test_codegraph_metrics.db";
-    std::remove(path);
+    TempDb temp_db("metrics.db");
 
-    Database db(path);
+    Database db(temp_db.path);
     db.init_schema();
 
     FileRecord fr; fr.path = "/tmp/metrics.cpp"; fr.language = "cpp"; fr.mtime = 0; fr.size = 100;
@@ -643,32 +688,30 @@ void test_compute_metrics() {
     GraphTraverser traverser(db);
     auto metrics = traverser.compute_metrics(5);
 
-    assert(metrics.total_nodes == 4);
-    assert(metrics.total_edges == 4);
-    assert(metrics.circular_deps == 0);
+    CHECK(metrics.total_nodes == 4);
+    CHECK(metrics.total_edges == 4);
+    CHECK(metrics.circular_deps == 0);
     // BFS 从 main 出发：main(0) → A(1), B(1) → C(2)。B 先被 main 访问，深度 1。
     // 所以最大深度是 2（main → B → C），不是 3（main → A → B → C 不是最短路径）
-    assert(metrics.max_call_depth == 2);
+    CHECK(metrics.max_call_depth == 2);
 
     // b 被调用 2 次（main 和 a 各调用一次），应该排第一
-    assert(!metrics.most_called.empty());
-    assert(metrics.most_called[0].first.name == "b");
-    assert(metrics.most_called[0].second == 2);
+    CHECK(!metrics.most_called.empty());
+    CHECK(metrics.most_called[0].first.name == "b");
+    CHECK(metrics.most_called[0].second == 2);
 
     // main 调用 2 个函数，a 调用 1 个，b 调用 1 个
-    assert(!metrics.most_calling.empty());
-    assert(metrics.most_calling[0].first.name == "main");
-    assert(metrics.most_calling[0].second == 2);
+    CHECK(!metrics.most_calling.empty());
+    CHECK(metrics.most_calling[0].first.name == "main");
+    CHECK(metrics.most_calling[0].second == 2);
 
-    std::remove(path);
     std::cout << "  [PASS] compute_metrics\n";
 }
 
 void test_impact_chain() {
-    const char* path = "/tmp/test_codegraph_impact.db";
-    std::remove(path);
+    TempDb temp_db("impact.db");
 
-    Database db(path);
+    Database db(temp_db.path);
     db.init_schema();
 
     // A -> B -> C (改 C 会影响 A 和 B)
@@ -688,7 +731,7 @@ void test_impact_chain() {
 
     // 改 C：影响 B 和 A
     auto impact = traverser.get_impact_chain(cid, 5);
-    assert(impact.size() == 2);
+    CHECK(impact.size() == 2);
 
     // 验证每个受影响节点都有反向路径
     // A → B → C，impact(C) = {A, B}
@@ -697,21 +740,20 @@ void test_impact_chain() {
     for (const auto& in : impact) {
         if (in.node.name == "b") {
             found_b = true;
-            assert(in.path.size() == 2);
-            assert(in.path[0] == cid);  // 从 C 开始
-            assert(in.path[1] == bid);  // 到 B（B 调用了 C）
+            CHECK(in.path.size() == 2);
+            CHECK(in.path[0] == cid);  // 从 C 开始
+            CHECK(in.path[1] == bid);  // 到 B（B 调用了 C）
         }
         if (in.node.name == "a") {
             found_a = true;
-            assert(in.path.size() == 3);
-            assert(in.path[0] == cid);  // 从 C 开始
-            assert(in.path[2] == aid);  // 到 A（A 调用了 B 调用了 C）
+            CHECK(in.path.size() == 3);
+            CHECK(in.path[0] == cid);  // 从 C 开始
+            CHECK(in.path[2] == aid);  // 到 A（A 调用了 B 调用了 C）
         }
     }
-    assert(found_b);
-    assert(found_a);
+    CHECK(found_b);
+    CHECK(found_a);
 
-    std::remove(path);
     std::cout << "  [PASS] impact_chain\n";
 }
 

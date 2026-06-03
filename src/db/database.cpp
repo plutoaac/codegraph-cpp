@@ -1,3 +1,23 @@
+/**
+ * database.cpp — SQLite 数据库层实现
+ *
+ * 本文件封装了所有与 SQLite 的交互，是 codegraph 的持久化层。
+ *
+ * 数据库架构：
+ *   - nodes 表：存储所有代码符号（函数、类、变量等）
+ *   - edges 表：存储符号间的关系（调用、包含、继承等）
+ *   - files 表：记录已索引的文件（用于增量更新判断）
+ *   - unresolved_refs 表：存储未解析的引用（跨文件调用，后续统一解析）
+ *   - nodes_fts：FTS5 虚表，支持全文搜索
+ *
+ * 设计要点：
+ *   - 使用 WAL 模式（PRAGMA journal_mode=WAL）支持并发读
+ *   - 批量插入复用 prepared statement，避免重复编译 SQL
+ *   - StmtGuard（unique_ptr + 自定义 deleter）确保 stmt 不泄漏
+ *   - read_node_row 中对 nullable 列做空指针检查
+ *   - FTS5 搜索结果按 kind 重排序（函数/类优先，变量其次，import 最后）
+ */
+
 #include "codegraph/db/database.h"
 #include <algorithm>
 #include <cctype>
@@ -7,16 +27,31 @@
 
 namespace codegraph {
 
+// ── 辅助工具 ──
+
+/**
+ * StmtDeleter：sqlite3_stmt 的自定义删除器。
+ * 配合 unique_ptr 使用，确保 stmt 在作用域结束时自动 finalize。
+ * 这是 RAII 模式在 C API 上的应用。
+ */
 struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { if (s) sqlite3_finalize(s); }
 };
 using StmtGuard = std::unique_ptr<sqlite3_stmt, StmtDeleter>;
 
+/**
+ * 构造 SQLite 错误信息的异常。
+ * 从 sqlite3_errmsg(db) 获取可读的错误描述。
+ */
 static std::runtime_error sqlite_error(sqlite3* db, const std::string& op) {
     return std::runtime_error(op + ": " +
                               (db ? sqlite3_errmsg(db) : "unknown sqlite error"));
 }
 
+/**
+ * 编译 SQL 语句，失败则抛异常。
+ * sqlite3_prepare_v2 将 SQL 文本编译为字节码，返回 stmt 指针。
+ */
 static sqlite3_stmt* prepare_or_throw(sqlite3* db, const char* sql, const std::string& op) {
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -25,12 +60,19 @@ static sqlite3_stmt* prepare_or_throw(sqlite3* db, const char* sql, const std::s
     return stmt;
 }
 
+/**
+ * 执行 SQL 直到完成（INSERT/UPDATE/DELETE），失败则抛异常。
+ */
 static void expect_done(sqlite3* db, sqlite3_stmt* stmt, const std::string& op) {
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         throw sqlite_error(db, op);
     }
 }
 
+/**
+ * 执行 SQL 并返回状态码（SELECT 返回 SQLITE_ROW，结束返回 SQLITE_DONE）。
+ * 如果返回非预期状态码则抛异常。
+ */
 static int step_or_throw(sqlite3* db, sqlite3_stmt* stmt, const std::string& op) {
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
@@ -39,10 +81,18 @@ static int step_or_throw(sqlite3* db, sqlite3_stmt* stmt, const std::string& op)
     return rc;
 }
 
-// 将用户查询转换为安全的 FTS5 查询字符串。
-// 问题：C++ 限定名如 "ns::test_func" 包含 ":"，FTS5 会将其解析为操作符。
-// 方案：检测到非字母数字字符时，用双引号包装为短语查询（"ns::test_func"），
-// 双引号内的字符不会被 FTS5 解析为操作符。
+/**
+ * 将用户查询转换为安全的 FTS5 查询字符串。
+ *
+ * 问题：C++ 限定名如 "ns::test_func" 包含 ":"，FTS5 会将其解析为操作符。
+ * 方案：检测到非字母数字字符时，用双引号包装为短语查询（"ns::test_func"），
+ * 双引号内的字符不会被 FTS5 解析为操作符。
+ *
+ * 安全性：
+ *   - 用户输入中的双引号 " 转义为 ""（FTS5 的转义规则）
+ *   - 空查询返回空字符串（不执行搜索）
+ *   - 纯字母数字查询直接返回（无需包装）
+ */
 static std::string make_fts_query(const std::string& query) {
     bool has_token_char = false;
     bool needs_phrase = false;
@@ -71,6 +121,51 @@ static std::string make_fts_query(const std::string& query) {
     return quoted;
 }
 
+// ── 数据库 Schema ──
+
+/**
+ * 数据库表结构定义。
+ *
+ * nodes 表：
+ *   - id: 自增主键
+ *   - kind: 节点类型（NodeKind 枚举的整数值）
+ *   - name: 符号名（如 "foo"）
+ *   - qualified_name: 限定名（如 "MyClass::foo"）
+ *   - file_path: 所在文件路径
+ *   - line/col/end_line/end_col: 位置信息
+ *   - signature: 函数签名
+ *   - docstring: 文档注释
+ *   - visibility: 访问控制（public/private/protected）
+ *   - is_static/is_const/is_exported: 修饰符
+ *
+ * edges 表：
+ *   - id: 自增主键
+ *   - source_id/target_id: 源和目标节点的 ID
+ *   - kind: 边类型（EdgeKind 枚举的整数值）
+ *   - line/col: 边的位置（调用发生的行号）
+ *   - metadata: 额外元数据（JSON 字符串）
+ *
+ * files 表：
+ *   - path: 文件路径（唯一约束）
+ *   - language: 语言标识
+ *   - mtime: 最后修改时间（用于增量更新判断）
+ *   - size: 文件大小（辅助增量判断）
+ *
+ * unresolved_refs 表：
+ *   - 存储第一遍索引时无法解析的跨文件引用
+ *   - resolve 命令会尝试将这些引用解析为正式的 edge
+ *
+ * nodes_fts 虚表：
+ *   - FTS5 全文搜索，索引 name/qualified_name/signature/docstring/file_path
+ *   - 通过触发器与 nodes 表自动同步
+ *   - bm25() 函数用于相关性排序
+ *
+ * 索引：
+ *   - idx_nodes_name: 按名字查找节点
+ *   - idx_nodes_file: 按文件查找节点
+ *   - idx_edges_source/target: 按源/目标查找边
+ *   - idx_edges_kind: 按类型过滤边
+ */
 static const char* SCHEMA_SQL = R"(
 CREATE TABLE IF NOT EXISTS nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +244,16 @@ CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
 )";
 
+// ── Database 生命周期 ──
+
+/**
+ * 构造函数：打开 SQLite 数据库并配置基本参数。
+ *
+ * 配置说明：
+ *   - busy_timeout=5000: 写锁冲突时等待 5 秒再报错（WAL 模式下很少触发）
+ *   - journal_mode=WAL: 写操作不阻塞读操作（关键性能优化）
+ *   - foreign_keys=ON: 启用外键约束（edges 表引用 nodes 表）
+ */
 Database::Database(const std::string& db_path) {
     if (sqlite3_open(db_path.c_str(), &db_) != SQLITE_OK) {
         throw std::runtime_error("Failed to open database: " + std::string(sqlite3_errmsg(db_)));
@@ -158,17 +263,28 @@ Database::Database(const std::string& db_path) {
     exec("PRAGMA foreign_keys=ON");
 }
 
+/**
+ * 析构函数：释放缓存的 prepared statement 和数据库连接。
+ */
 Database::~Database() {
     finalize_cached_stmts();
     if (db_) sqlite3_close(db_);
 }
 
+/**
+ * 释放所有缓存的 prepared statement。
+ * 批量插入时会缓存 stmt 以避免重复编译，析构时必须释放。
+ */
 void Database::finalize_cached_stmts() {
     if (stmt_insert_node_) { sqlite3_finalize(stmt_insert_node_); stmt_insert_node_ = nullptr; }
     if (stmt_insert_edge_) { sqlite3_finalize(stmt_insert_edge_); stmt_insert_edge_ = nullptr; }
     if (stmt_insert_unresolved_) { sqlite3_finalize(stmt_insert_unresolved_); stmt_insert_unresolved_ = nullptr; }
 }
 
+/**
+ * 移动构造函数：转移数据库所有权。
+ * 将 other 的指针置空，防止 other 析构时关闭数据库。
+ */
 Database::Database(Database&& other) noexcept
     : db_(other.db_),
       stmt_insert_node_(other.stmt_insert_node_),
@@ -180,6 +296,9 @@ Database::Database(Database&& other) noexcept
     other.stmt_insert_unresolved_ = nullptr;
 }
 
+/**
+ * 移动赋值运算符：释放当前资源，转移 other 的所有权。
+ */
 Database& Database::operator=(Database&& other) noexcept {
     if (this != &other) {
         finalize_cached_stmts();
@@ -196,6 +315,18 @@ Database& Database::operator=(Database&& other) noexcept {
     return *this;
 }
 
+// ── 行读取 ──
+
+/**
+ * 从 SELECT 结果的当前行读取一个 Node 对象。
+ *
+ * 列顺序：id, kind, name, qualified_name, file_path, language,
+ *          line, col, end_line, end_col, signature, docstring,
+ *          visibility, is_static, is_const, is_exported
+ *
+ * 注意：SQLite 的 TEXT 列可能返回 NULL（如 qualified_name 未设置），
+ * sqlite3_column_text() 对 NULL 返回 nullptr，需要检查后给默认值。
+ */
 Node Database::read_node_row(sqlite3_stmt* stmt) {
     Node n;
     n.id = sqlite3_column_int64(stmt, 0);
@@ -224,6 +355,12 @@ Node Database::read_node_row(sqlite3_stmt* stmt) {
     return n;
 }
 
+// ── 基础操作 ──
+
+/**
+ * 执行任意 SQL（不返回结果）。
+ * 用于 DDL（CREATE TABLE）、PRAGMA 设置等。
+ */
 void Database::exec(const char* sql) {
     char* err = nullptr;
     if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
@@ -233,12 +370,22 @@ void Database::exec(const char* sql) {
     }
 }
 
+/** 初始化数据库 schema（建表、建索引、建触发器）。 */
 void Database::init_schema() { exec(SCHEMA_SQL); }
 
+/** 开始事务。 */
 void Database::begin_transaction() { exec("BEGIN"); }
+/** 提交事务。 */
 void Database::commit() { exec("COMMIT"); }
+/** 回滚事务。 */
 void Database::rollback() { exec("ROLLBACK"); }
 
+// ── 节点操作 ──
+
+/**
+ * 插入单个节点，返回自增 ID。
+ * 使用 StmtGuard 确保 stmt 在函数返回时自动释放。
+ */
 int64_t Database::insert_node(const Node& node) {
     const char* sql = R"(INSERT INTO nodes
         (kind, name, qualified_name, file_path, language, line, col, end_line, end_col, signature, docstring, visibility, is_static, is_const, is_exported)
@@ -264,6 +411,10 @@ int64_t Database::insert_node(const Node& node) {
     return sqlite3_last_insert_rowid(db_);
 }
 
+/**
+ * 按 ID 获取单个节点。
+ * 返回 optional：找到返回 Node，找不到返回 nullopt。
+ */
 std::optional<Node> Database::get_node(int64_t id) {
     const char* sql = "SELECT id, kind, name, qualified_name, file_path, language, line, col, end_line, end_col, signature, docstring, visibility, is_static, is_const, is_exported FROM nodes WHERE id=?";
     sqlite3_stmt* stmt = prepare_or_throw(db_, sql, "prepare get_node");
@@ -274,14 +425,24 @@ std::optional<Node> Database::get_node(int64_t id) {
     return read_node_row(stmt);
 }
 
-// 按名字查找节点。两阶段查询：
-//   1. 精确匹配：name 或 qualified_name 或 qualified_name 以 "::name" 结尾
-//   2. 模糊匹配：name 或 qualified_name 包含目标字符串（排除已匹配的）
-//
-// 排序优先级（ORDER BY 三个 CASE）：
-//   - 名字匹配度：精确 name > 精确 qualified_name > 后缀匹配
-//   - 有 signature 的优先（定义 > 前向声明）
-//   - .cpp/.cc 文件优先（实现 > 头文件声明）
+/**
+ * 按名字查找节点。两阶段查询：
+ *
+ * 第一阶段（精确匹配）：
+ *   WHERE name=? OR qualified_name=? OR qualified_name LIKE '%::name'
+ *   排序优先级：
+ *     1. 名字匹配度：精确 name > 精确 qualified_name > 后缀匹配
+ *     2. 有 signature 的优先（定义 > 前向声明）
+ *     3. .cpp/.cc 文件优先（实现 > 头文件声明）
+ *
+ * 第二阶段（模糊匹配）：
+ *   如果精确匹配结果不足，用 LIKE '%name%' 补充
+ *   排除第一阶段已匹配的结果
+ *
+ * 为什么用两阶段：
+ *   精确匹配结果更准确，应该优先返回。
+ *   模糊匹配用于处理部分匹配的情况（如搜索 "foo" 找到 "bar_foo_baz"）。
+ */
 std::vector<Node> Database::find_nodes_by_name(const std::string& name, int limit) {
     std::vector<Node> results;
 
@@ -316,6 +477,7 @@ std::vector<Node> Database::find_nodes_by_name(const std::string& name, int limi
     int remaining = limit - static_cast<int>(results.size());
     if (remaining <= 0) return results;
 
+    // 第二阶段：模糊匹配（排除已匹配的精确结果）
     const char* like_sql = R"(SELECT id, kind, name, qualified_name, file_path, language, line, col, end_line, end_col, signature, docstring, visibility, is_static, is_const, is_exported
         FROM nodes
         WHERE kind NOT IN (0, 10, 11) AND (name LIKE ? OR qualified_name LIKE ?)
@@ -334,6 +496,13 @@ std::vector<Node> Database::find_nodes_by_name(const std::string& name, int limi
     return results;
 }
 
+/**
+ * 按文件路径查找该文件中的所有节点。
+ * 用于：
+ *   - 增量更新时清理旧节点
+ *   - change-impact 时定位受影响的符号
+ *   - export 时收集文件中的所有符号
+ */
 std::vector<Node> Database::find_nodes_by_file(const std::string& file_path) {
     std::vector<Node> results;
     const char* sql = "SELECT id, kind, name, qualified_name, file_path, language, line, col, end_line, end_col, signature, docstring, visibility, is_static, is_const, is_exported FROM nodes WHERE file_path=?";
@@ -347,6 +516,7 @@ std::vector<Node> Database::find_nodes_by_file(const std::string& file_path) {
     return results;
 }
 
+/** 统计节点总数。 */
 int64_t Database::count_nodes() {
     sqlite3_stmt* stmt = prepare_or_throw(db_, "SELECT COUNT(*) FROM nodes", "prepare count_nodes");
     StmtGuard guard(stmt);
@@ -356,6 +526,11 @@ int64_t Database::count_nodes() {
     return sqlite3_column_int64(stmt, 0);
 }
 
+// ── 边操作 ──
+
+/**
+ * 插入单条边，返回自增 ID。
+ */
 int64_t Database::insert_edge(const Edge& edge) {
     const char* sql = "INSERT INTO edges (source_id, target_id, kind, line, col, metadata) VALUES (?, ?, ?, ?, ?, ?)";
     sqlite3_stmt* stmt = prepare_or_throw(db_, sql, "prepare insert_edge");
@@ -370,6 +545,12 @@ int64_t Database::insert_edge(const Edge& edge) {
     return sqlite3_last_insert_rowid(db_);
 }
 
+/**
+ * 获取从某节点出发的所有指定类型的边。
+ * 用于：
+ *   - get_edges_from(id, Calls) → 找该函数调用了谁（callees）
+ *   - get_edges_from(id, Contains) → 找文件包含哪些符号
+ */
 std::vector<Edge> Database::get_edges_from(int64_t source_id, EdgeKind kind) {
     std::vector<Edge> results;
     const char* sql = "SELECT id, source_id, target_id, kind, line, col, metadata FROM edges WHERE source_id=? AND kind=?";
@@ -392,6 +573,12 @@ std::vector<Edge> Database::get_edges_from(int64_t source_id, EdgeKind kind) {
     return results;
 }
 
+/**
+ * 获取指向某节点的所有指定类型的边。
+ * 用于：
+ *   - get_edges_to(id, Calls) → 找谁调用了该函数（callers）
+ *   - get_edges_to(id, References) → 找谁引用了该符号
+ */
 std::vector<Edge> Database::get_edges_to(int64_t target_id, EdgeKind kind) {
     std::vector<Edge> results;
     const char* sql = "SELECT id, source_id, target_id, kind, line, col, metadata FROM edges WHERE target_id=? AND kind=?";
@@ -414,6 +601,10 @@ std::vector<Edge> Database::get_edges_to(int64_t target_id, EdgeKind kind) {
     return results;
 }
 
+/**
+ * 获取从某节点出发的所有边（不限类型）。
+ * 用于 DOT 导出时收集所有关系。
+ */
 std::vector<Edge> Database::get_all_edges_from(int64_t source_id) {
     std::vector<Edge> results;
     const char* sql = "SELECT id, source_id, target_id, kind, line, col, metadata FROM edges WHERE source_id=?";
@@ -435,6 +626,7 @@ std::vector<Edge> Database::get_all_edges_from(int64_t source_id) {
     return results;
 }
 
+/** 统计边总数。 */
 int64_t Database::count_edges() {
     sqlite3_stmt* stmt = prepare_or_throw(db_, "SELECT COUNT(*) FROM edges", "prepare count_edges");
     StmtGuard guard(stmt);
@@ -444,6 +636,12 @@ int64_t Database::count_edges() {
     return sqlite3_column_int64(stmt, 0);
 }
 
+// ── 文件操作 ──
+
+/**
+ * 插入或更新文件记录。
+ * INSERT OR REPLACE：如果 path 已存在则更新 mtime/size。
+ */
 int64_t Database::insert_file(const FileRecord& file) {
     const char* sql = "INSERT OR REPLACE INTO files (path, language, mtime, size) VALUES (?, ?, ?, ?)";
     sqlite3_stmt* stmt = prepare_or_throw(db_, sql, "prepare insert_file");
@@ -456,6 +654,7 @@ int64_t Database::insert_file(const FileRecord& file) {
     return sqlite3_last_insert_rowid(db_);
 }
 
+/** 按路径获取文件记录。 */
 std::optional<FileRecord> Database::get_file(const std::string& path) {
     const char* sql = "SELECT id, path, language, mtime, size FROM files WHERE path=?";
     sqlite3_stmt* stmt = prepare_or_throw(db_, sql, "prepare get_file");
@@ -472,6 +671,7 @@ std::optional<FileRecord> Database::get_file(const std::string& path) {
     return f;
 }
 
+/** 获取所有已索引的文件记录。 */
 std::vector<FileRecord> Database::get_all_files() {
     std::vector<FileRecord> results;
     const char* sql = "SELECT id, path, language, mtime, size FROM files";
@@ -490,6 +690,7 @@ std::vector<FileRecord> Database::get_all_files() {
     return results;
 }
 
+/** 更新文件的修改时间（增量索引时用）。 */
 void Database::update_file_mtime(const std::string& path, int64_t mtime) {
     const char* sql = "UPDATE files SET mtime=? WHERE path=?";
     sqlite3_stmt* stmt = prepare_or_throw(db_, sql, "prepare update_file_mtime");
@@ -499,6 +700,13 @@ void Database::update_file_mtime(const std::string& path, int64_t mtime) {
     expect_done(db_, stmt, "update_file_mtime");
 }
 
+// ── 删除操作（增量索引用） ──
+
+/**
+ * 删除某文件所有节点的关联边。
+ * 增量索引时，先删边再删节点（外键约束）。
+ * 包括该文件中的节点作为 source 或 target 的所有边。
+ */
 void Database::delete_edges_for_file_nodes(const std::string& file_path) {
     const char* sql = R"(DELETE FROM edges WHERE source_id IN (SELECT id FROM nodes WHERE file_path=?)
         OR target_id IN (SELECT id FROM nodes WHERE file_path=?))";
@@ -509,6 +717,7 @@ void Database::delete_edges_for_file_nodes(const std::string& file_path) {
     expect_done(db_, stmt, "delete_edges_for_file_nodes");
 }
 
+/** 删除某文件的所有节点。 */
 void Database::delete_nodes_by_file(const std::string& file_path) {
     const char* sql = "DELETE FROM nodes WHERE file_path=?";
     sqlite3_stmt* stmt = prepare_or_throw(db_, sql, "prepare delete_nodes_by_file");
@@ -517,6 +726,7 @@ void Database::delete_nodes_by_file(const std::string& file_path) {
     expect_done(db_, stmt, "delete_nodes_by_file");
 }
 
+/** 删除某文件节点产生的未解析引用。 */
 void Database::delete_unresolved_refs_by_file(const std::string& file_path) {
     const char* sql = R"(DELETE FROM unresolved_refs WHERE source_node_id IN (SELECT id FROM nodes WHERE file_path=?))";
     sqlite3_stmt* stmt = prepare_or_throw(db_, sql, "prepare delete_unresolved_refs_by_file");
@@ -525,6 +735,7 @@ void Database::delete_unresolved_refs_by_file(const std::string& file_path) {
     expect_done(db_, stmt, "delete_unresolved_refs_by_file");
 }
 
+/** 删除文件记录。 */
 void Database::delete_file(const std::string& file_path) {
     const char* sql = "DELETE FROM files WHERE path=?";
     sqlite3_stmt* stmt = prepare_or_throw(db_, sql, "prepare delete_file");
@@ -533,6 +744,9 @@ void Database::delete_file(const std::string& file_path) {
     expect_done(db_, stmt, "delete_file");
 }
 
+// ── 未解析引用操作 ──
+
+/** 插入一条未解析引用。 */
 int64_t Database::insert_unresolved_ref(const UnresolvedRef& ref) {
     const char* sql = "INSERT INTO unresolved_refs (source_node_id, ref_name, ref_kind, line, col) VALUES (?, ?, ?, ?, ?)";
     sqlite3_stmt* stmt = prepare_or_throw(db_, sql, "prepare insert_unresolved_ref");
@@ -546,6 +760,7 @@ int64_t Database::insert_unresolved_ref(const UnresolvedRef& ref) {
     return sqlite3_last_insert_rowid(db_);
 }
 
+/** 获取所有未解析引用。 */
 std::vector<UnresolvedRef> Database::get_unresolved_refs() {
     std::vector<UnresolvedRef> results;
     const char* sql = "SELECT id, source_node_id, ref_name, ref_kind, line, col FROM unresolved_refs";
@@ -565,6 +780,7 @@ std::vector<UnresolvedRef> Database::get_unresolved_refs() {
     return results;
 }
 
+/** 删除单条未解析引用（解析成功后调用）。 */
 void Database::delete_unresolved_ref(int64_t ref_id) {
     const char* sql = "DELETE FROM unresolved_refs WHERE id=?";
     sqlite3_stmt* stmt = prepare_or_throw(db_, sql, "prepare delete_unresolved_ref");
@@ -573,6 +789,13 @@ void Database::delete_unresolved_ref(int64_t ref_id) {
     expect_done(db_, stmt, "delete_unresolved_ref");
 }
 
+// ── 批量查询 ──
+
+/**
+ * 按 ID 列表批量获取节点。
+ * 使用 IN (?) 占位符动态构建 SQL。
+ * 用于图遍历时批量获取邻居节点。
+ */
 std::vector<Node> Database::get_nodes_by_ids(const std::vector<int64_t>& ids) {
     std::vector<Node> results;
     if (ids.empty()) return results;
@@ -600,6 +823,26 @@ std::vector<Node> Database::get_nodes_by_ids(const std::vector<int64_t>& ids) {
     return results;
 }
 
+// ── 全文搜索 ──
+
+/**
+ * FTS5 全文搜索。
+ *
+ * 流程：
+ *   1. 将用户查询转为安全的 FTS5 查询（处理特殊字符）
+ *   2. 查询 nodes_fts 虚表，用 bm25() 排序
+ *   3. 结果按 kind 重排序（函数/类 > 变量 > import）
+ *   4. 截断到 limit 条
+ *
+ * 为什么 over-fetch 3x：
+ *   bm25() 按文本相关性排序，但我们需要按 kind 优先级排序。
+ *   多取一些结果，排序后再截断，避免遗漏重要的 kind。
+ *
+ * kind 重排序策略：
+ *   rank 0: Function, Method, Class, Struct, Enum, Namespace（最重要的符号）
+ *   rank 1: Variable, TypeAlias, EnumMember, Field（次要符号）
+ *   rank 2: 其他（Import 等）
+ */
 std::vector<Node> Database::search_fts(const std::string& query, int limit) {
     std::vector<Node> results;
     const std::string fts_query = make_fts_query(query);
@@ -650,14 +893,23 @@ std::vector<Node> Database::search_fts(const std::string& query, int limit) {
     return results;
 }
 
+// ── 死代码检测 ──
+
+/**
+ * 查找可能的死代码（没有被任何其他函数调用的函数/方法）。
+ *
+ * 排除条件（避免误报）：
+ *   1. 只检测函数/方法（kind 1, 2），不检测类型/类
+ *   2. 排除 main() 入口点
+ *   3. 排除头文件中的函数（公共 API）
+ *   4. 排除测试/基准测试/演示文件
+ *   5. 排除构建目录和 protobuf 文件
+ *   6. 排除有 qualified_name 的方法（类成员，通常被外部调用）
+ *   7. 排除常见名字（如 lock、guard、buffer 等局部变量名）
+ *   8. 排除析构函数（~ClassName）
+ *   9. 必须没有任何入边（除了 "contains" 边）
+ */
 std::vector<Node> Database::find_dead_code(const std::string& exclude_pattern) {
-    // Smart dead code detection:
-    // 1. Only functions/methods (kind 1, 2) - not types/classes
-    // 2. Exclude header files (public API)
-    // 3. Exclude main() entry points
-    // 4. Exclude test/benchmark/demo files
-    // 5. Exclude build directories and protobuf files
-    // 6. Must have NO incoming edges (except "contains")
     std::string sql = R"(
         SELECT id, kind, name, qualified_name, file_path, language,
                line, col, end_line, end_col, signature, docstring,
@@ -710,6 +962,7 @@ std::vector<Node> Database::find_dead_code(const std::string& exclude_pattern) {
     return results;
 }
 
+/** 统计已索引的文件数。 */
 int64_t Database::count_files() {
     sqlite3_stmt* stmt = prepare_or_throw(db_, "SELECT COUNT(*) FROM files", "prepare count_files");
     StmtGuard guard(stmt);
@@ -719,8 +972,12 @@ int64_t Database::count_files() {
     return sqlite3_column_int64(stmt, 0);
 }
 
-// ── Batch operations (reuse prepared statements) ──
+// ── 批量操作（复用 prepared statement，避免重复编译） ──
 
+/**
+ * bind_node：将 Node 对象绑定到 prepared statement 的参数。
+ * 复用 stmt 时，先 reset() 清除上一次的状态，再 clear_bindings() 清除旧绑定。
+ */
 static void bind_node(sqlite3_stmt* stmt, const Node& node) {
     sqlite3_reset(stmt);
     sqlite3_clear_bindings(stmt);
@@ -741,6 +998,17 @@ static void bind_node(sqlite3_stmt* stmt, const Node& node) {
     sqlite3_bind_int(stmt, 15, node.is_exported ? 1 : 0);
 }
 
+/**
+ * 批量插入节点。
+ *
+ * 性能优化：
+ *   - prepared statement 只编译一次，后续复用
+ *   - 每次调用 bind_node() → step() → 收集返回的 rowid
+ *   - out_ids 用于后续构建 edge 时映射临时 ID 到真实 ID
+ *
+ * 为什么不用事务包裹：
+ *   调用方（index_extracted_files）已经在事务中，这里不需要嵌套。
+ */
 void Database::insert_nodes_batch(const std::vector<Node>& nodes, std::vector<int64_t>& out_ids) {
     if (nodes.empty()) return;
     if (!stmt_insert_node_) {
@@ -762,6 +1030,10 @@ void Database::insert_nodes_batch(const std::vector<Node>& nodes, std::vector<in
     }
 }
 
+/**
+ * 批量插入边。
+ * 同样复用 prepared statement，每个 edge 绑定 → step → 继续。
+ */
 void Database::insert_edges_batch(const std::vector<Edge>& edges) {
     if (edges.empty()) return;
     if (!stmt_insert_edge_) {
@@ -783,6 +1055,9 @@ void Database::insert_edges_batch(const std::vector<Edge>& edges) {
     }
 }
 
+/**
+ * 批量插入未解析引用。
+ */
 void Database::insert_unresolved_batch(const std::vector<UnresolvedRef>& refs) {
     if (refs.empty()) return;
     if (!stmt_insert_unresolved_) {
@@ -803,6 +1078,10 @@ void Database::insert_unresolved_batch(const std::vector<UnresolvedRef>& refs) {
     }
 }
 
+/**
+ * 批量删除已解析的未解析引用。
+ * resolve_unresolved_refs() 解析成功后，删除对应的 unresolved_refs 记录。
+ */
 void Database::delete_unresolved_refs_batch(const std::vector<int64_t>& ref_ids) {
     if (ref_ids.empty()) return;
     const char* sql = "DELETE FROM unresolved_refs WHERE id=?";
