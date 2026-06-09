@@ -17,14 +17,21 @@
  *   codegraph_files           — 文件列表
  *   codegraph_search_semantic — 语义搜索
  *   codegraph_change_impact   — git diff 影响分析
+ *
+ * 缓存机制：
+ *   - 查询结果缓存（LRU，30s TTL）
+ *   - 索引更新时自动失效（generation 机制）
+ *   - 缓存键格式：tool_name:query_json
  */
 
 #pragma once
 
 #include "codegraph/context/context_builder.h"
+#include "codegraph/core/lru_cache.h"
 #include "codegraph/db/database.h"
 #include "codegraph/graph/traverser.h"
 #include <nlohmann/json.hpp>
+#include <string>
 
 namespace codegraph {
 
@@ -38,10 +45,28 @@ public:
      */
     void run();
 
+    /**
+     * 使缓存失效。
+     * 当索引更新时调用，确保下次查询返回最新数据。
+     */
+    void invalidate_cache();
+
 private:
     Database& db_;
     GraphTraverser& traverser_;
     ContextBuilder& context_;
+
+    // 查询结果缓存（LRU，30s TTL，100 条上限）
+    LruCache<std::string, std::string> cache_{100, 30};
+
+    // 索引时间戳（用于检测索引更新）
+    int64_t last_index_timestamp_ = 0;
+
+    /**
+     * 检查索引是否更新，如果是则失效缓存。
+     * 读取 .codegraph/index_timestamp 文件，与上次记录的时间戳比较。
+     */
+    void check_index_update();
 
     // ── JSON-RPC 路由 ──
 

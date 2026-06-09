@@ -641,6 +641,15 @@ static void index_directory(Database& db, const std::string& path, bool incremen
     }
 
     int node_count = index_extracted_files(db, extracted);
+
+    // 更新索引时间戳（用于 MCP 缓存失效）
+    std::string timestamp_file = ".codegraph/index_timestamp";
+    std::ofstream ts(timestamp_file);
+    if (ts) {
+        ts << std::chrono::system_clock::now().time_since_epoch().count();
+        ts.close();
+    }
+
     std::cout << "Indexed " << extracted.size() << " files, "
               << node_count << " nodes, " << db.count_edges() << " edges" << std::endl;
 }

@@ -28,8 +28,10 @@
 #include "codegraph/mcp/mcp_server.h"
 #include "codegraph/diff/diff_parser.h"
 #include <cerrno>
+#include <chrono>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <sys/wait.h>
@@ -40,6 +42,51 @@ namespace codegraph {
 
 McpServer::McpServer(Database& db, GraphTraverser& traverser, ContextBuilder& context)
     : db_(db), traverser_(traverser), context_(context) {}
+
+/**
+ * 使缓存失效。
+ * 当索引更新时调用，确保下次查询返回最新数据。
+ */
+void McpServer::invalidate_cache() {
+    cache_.invalidate();
+}
+
+/**
+ * 检查索引是否更新，如果是则失效缓存。
+ * 读取 .codegraph/index_timestamp 文件，与上次记录的时间戳比较。
+ *
+ * 工作原理：
+ *   1. 每次 index 命令完成后，写入当前时间戳到 index_timestamp 文件
+ *   2. MCP server 每次处理请求时检查该文件
+ *   3. 如果时间戳变化，说明索引已更新，清空缓存
+ */
+void McpServer::check_index_update() {
+    std::string timestamp_file = ".codegraph/index_timestamp";
+    if (!std::filesystem::exists(timestamp_file)) {
+        return;
+    }
+
+    std::ifstream ifs(timestamp_file);
+    if (!ifs) return;
+
+    int64_t current_timestamp = 0;
+    ifs >> current_timestamp;
+
+    if (current_timestamp > 0 && current_timestamp != last_index_timestamp_) {
+        // 索引已更新，失效缓存
+        cache_.invalidate();
+        last_index_timestamp_ = current_timestamp;
+    }
+}
+
+/**
+ * 生成缓存键。
+ * 格式：tool_name:args_json
+ * 确保相同参数的查询命中缓存。
+ */
+static std::string make_cache_key(const std::string& tool_name, const nlohmann::json& args) {
+    return tool_name + ":" + args.dump();
+}
 
 /**
  * 主循环：从 stdin 逐行读取 JSON-RPC 请求，处理后输出到 stdout。
@@ -87,6 +134,9 @@ void McpServer::run() {
  *   - notifications/initialized: 客户端初始化完成通知（无响应）
  */
 nlohmann::json McpServer::handle_request(const nlohmann::json& request) {
+    // 检查索引是否更新，如果是则失效缓存
+    check_index_update();
+
     std::string method = request.value("method", "");
     auto id = request.contains("id") ? request["id"] : nlohmann::json(nullptr);
     auto params = request.value("params", nlohmann::json::object());
@@ -284,43 +334,98 @@ nlohmann::json McpServer::handle_tools_call(const nlohmann::json& params) {
 
 /** 符号搜索：委托给 ContextBuilder::search_symbols()。 */
 nlohmann::json McpServer::tool_search(const nlohmann::json& args) {
+    // 检查缓存
+    auto cache_key = make_cache_key("search", args);
+    if (auto cached = cache_.get(cache_key)) {
+        return make_result(*cached);
+    }
+
     std::string query = args.value("query", "");
     int limit = args.value("limit", 20);
     auto results = context_.search_symbols(query, limit);
-    return make_result(results.dump());
+    auto result_str = results.dump();
+
+    // 存入缓存
+    cache_.put(cache_key, result_str);
+
+    return make_result(result_str);
 }
 
 /** 符号上下文：委托给 ContextBuilder::build_context()。 */
 nlohmann::json McpServer::tool_context(const nlohmann::json& args) {
+    // 检查缓存
+    auto cache_key = make_cache_key("context", args);
+    if (auto cached = cache_.get(cache_key)) {
+        return make_result(*cached);
+    }
+
     std::string symbol = args.value("symbol", "");
     int limit = args.value("limit", 10);
     int max_depth = args.value("max_depth", 3);
     auto results = context_.build_context(symbol, limit, max_depth);
-    return make_result(results.dump());
+    auto result_str = results.dump();
+
+    // 存入缓存
+    cache_.put(cache_key, result_str);
+
+    return make_result(result_str);
 }
 
 /** callers 查询。 */
 nlohmann::json McpServer::tool_callers(const nlohmann::json& args) {
+    // 检查缓存
+    auto cache_key = make_cache_key("callers", args);
+    if (auto cached = cache_.get(cache_key)) {
+        return make_result(*cached);
+    }
+
     std::string symbol = args.value("symbol", "");
     int max_depth = args.value("max_depth", 3);
     auto results = context_.get_callers(symbol, max_depth);
-    return make_result(results.dump());
+    auto result_str = results.dump();
+
+    // 存入缓存
+    cache_.put(cache_key, result_str);
+
+    return make_result(result_str);
 }
 
 /** callees 查询。 */
 nlohmann::json McpServer::tool_callees(const nlohmann::json& args) {
+    // 检查缓存
+    auto cache_key = make_cache_key("callees", args);
+    if (auto cached = cache_.get(cache_key)) {
+        return make_result(*cached);
+    }
+
     std::string symbol = args.value("symbol", "");
     int max_depth = args.value("max_depth", 3);
     auto results = context_.get_callees(symbol, max_depth);
-    return make_result(results.dump());
+    auto result_str = results.dump();
+
+    // 存入缓存
+    cache_.put(cache_key, result_str);
+
+    return make_result(result_str);
 }
 
 /** 影响分析。 */
 nlohmann::json McpServer::tool_impact(const nlohmann::json& args) {
+    // 检查缓存
+    auto cache_key = make_cache_key("impact", args);
+    if (auto cached = cache_.get(cache_key)) {
+        return make_result(*cached);
+    }
+
     std::string symbol = args.value("symbol", "");
     int max_depth = args.value("max_depth", 5);
     auto results = context_.get_impact(symbol, max_depth);
-    return make_result(results.dump());
+    auto result_str = results.dump();
+
+    // 存入缓存
+    cache_.put(cache_key, result_str);
+
+    return make_result(result_str);
 }
 
 /**
@@ -328,6 +433,12 @@ nlohmann::json McpServer::tool_impact(const nlohmann::json& args) {
  * 与 context 不同，这里只返回符号本身，不遍历图。
  */
 nlohmann::json McpServer::tool_node(const nlohmann::json& args) {
+    // 检查缓存
+    auto cache_key = make_cache_key("node", args);
+    if (auto cached = cache_.get(cache_key)) {
+        return make_result(*cached);
+    }
+
     std::string symbol = args.value("symbol", "");
     auto nodes = db_.find_nodes_by_name(symbol, 1);
     if (nodes.empty()) return make_error("Symbol not found: " + symbol);
@@ -339,22 +450,49 @@ nlohmann::json McpServer::tool_node(const nlohmann::json& args) {
         {"line", nodes[0].line},
         {"signature", nodes[0].signature}
     };
-    return make_result(node_json.dump());
+    auto result_str = node_json.dump();
+
+    // 存入缓存
+    cache_.put(cache_key, result_str);
+
+    return make_result(result_str);
 }
 
 /** 索引统计。 */
-nlohmann::json McpServer::tool_status(const nlohmann::json&) {
-    return make_result(context_.get_status().dump());
+nlohmann::json McpServer::tool_status(const nlohmann::json& args) {
+    // 检查缓存
+    auto cache_key = make_cache_key("status", args);
+    if (auto cached = cache_.get(cache_key)) {
+        return make_result(*cached);
+    }
+
+    auto result_str = context_.get_status().dump();
+
+    // 存入缓存
+    cache_.put(cache_key, result_str);
+
+    return make_result(result_str);
 }
 
 /** 已索引文件列表。 */
-nlohmann::json McpServer::tool_files(const nlohmann::json&) {
+nlohmann::json McpServer::tool_files(const nlohmann::json& args) {
+    // 检查缓存
+    auto cache_key = make_cache_key("files", args);
+    if (auto cached = cache_.get(cache_key)) {
+        return make_result(*cached);
+    }
+
     auto files = db_.get_all_files();
     nlohmann::json result = nlohmann::json::array();
     for (auto& f : files) {
         result.push_back({{"path", f.path}, {"language", f.language}});
     }
-    return make_result(result.dump());
+    auto result_str = result.dump();
+
+    // 存入缓存
+    cache_.put(cache_key, result_str);
+
+    return make_result(result_str);
 }
 
 /**
